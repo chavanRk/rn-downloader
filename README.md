@@ -122,4 +122,4 @@ await clearCache();
 
 ---
 
-_Made natively for the community 🤝_
+_Made natively for the community 🤝 by Rohit Chavan_
