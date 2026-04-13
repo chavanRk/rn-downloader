@@ -1,6 +1,6 @@
 # 🚀 rn-downloader
 
-The easiest way to download files in React Native — with background support, pause/resume, and cache management built-in.
+The easiest way to download files in React Native — with background support, pause/resume, upload, and cache management built-in.
 
 > 100% pure native code (Kotlin + Swift). Zero third-party dependencies.
 
@@ -11,11 +11,13 @@ The easiest way to download files in React Native — with background support, p
 - ⏸ **Pause & Resume** — resume mid-download using HTTP Range requests
 - ❌ **Cancel** — cancel any active download, partial files are cleaned up automatically
 - 🔄 **Re-attach** — reconnect to background downloads after app restart
+- 🔑 **Custom Headers** — support for Authorization tokens and custom metadata
+- 📂 **Custom Destinations** — save to `downloads`, `cache`, or `documents` folders
+- 📤 **Multipart Upload** — simple, native file uploading
+- 🛡️ **Checksum Validation** — verify file integrity (MD5, SHA1, SHA256) after download
 - 📱 **Expo Support** — includes a config plugin for zero-config integration
 - ⚡ **TurboModules** — built on the React Native New Architecture
-- 📦 **File management** — list, delete individual files, or clear all downloads from Downloads folder
-- 📂 **Smart file naming** — auto-detects filename from URL if not provided
-- ⚡ **Lightweight** — zero base dependencies
+- 📦 **File management** — list, delete individual files, or clear all downloads
 
 ---
 
@@ -23,23 +25,7 @@ The easiest way to download files in React Native — with background support, p
 
 ```sh
 npm install rn-downloader
-# or
-yarn add rn-downloader
 ```
-
-```
-
-### 🍎 Expo Installation
-Add the plugin to your `app.json` or `app.config.js`:
-```json
-{
-  "expo": {
-    "plugins": ["rn-downloader"]
-  }
-}
-```
-
-> iOS: For bare projects, run `pod install` in your `ios/` directory after installing.
 
 ---
 
@@ -48,28 +34,42 @@ Add the plugin to your `app.json` or `app.config.js`:
 ### `download(options)`
 
 ```javascript
-import { download, onDownloadComplete, onDownloadError } from 'rn-downloader';
+import { download } from 'rn-downloader';
 
-// Foreground download
 const result = await download({
   url: 'https://example.com/file.pdf',
   fileName: 'my_file.pdf',
-  onProgress: (percent) => console.log(`Progress: ${percent}%`),
+  headers: { 'Authorization': 'Bearer <token>' },
+  destination: 'documents', // 'downloads' | 'cache' | 'documents'
+  checksum: {
+    hash: 'd41d8cd98f00b204e9800998ecf8427e',
+    algorithm: 'md5'
+  },
+  onProgress: (p) => console.log(`${p}%`),
 });
-if (result.success) {
-  console.log('Saved to:', result.filePath);
-  console.log('Download ID:', result.downloadId);
-}
+```
 
-// Background download (resolves immediately with downloadId)
-const { downloadId } = await download({
-  url: 'https://example.com/video.mp4',
-  background: true,
+---
+
+### `upload(options)`
+
+```javascript
+import { upload } from 'rn-downloader';
+
+const result = await upload({
+  url: 'https://example.com/api/upload',
+  filePath: '/path/to/my_image.jpg',
+  fieldName: 'avatar', // default: 'file'
+  parameters: {
+    'userId': '123'
+  },
+  headers: { 'X-Custom-Header': 'value' },
+  onProgress: (p) => console.log(`Uploading: ${p}%`),
 });
-const unsub = onDownloadComplete((r) => {
-  console.log('Done:', r.filePath);
-  unsub();
-});
+
+if (result.success) {
+  console.log('Response:', result.data);
+}
 ```
 
 ---
@@ -77,41 +77,11 @@ const unsub = onDownloadComplete((r) => {
 ### Pause / Resume / Cancel
 
 ```javascript
-import {
-  download,
-  pauseDownload,
-  resumeDownload,
-  cancelDownload,
-} from 'rn-downloader';
+import { pauseDownload, resumeDownload, cancelDownload } from 'rn-downloader';
 
-const { downloadId } = await download({
-  url: 'https://example.com/file.zip',
-  onProgress: (p) => console.log(`${p}%`),
-});
-
-await pauseDownload(downloadId); // pause
-await resumeDownload(downloadId); // resume from where it left off (HTTP Range)
-await cancelDownload(downloadId); // cancel + delete partial file
-```
-
----
-
-### Re-attach (Background Persistence)
-
-If the app is closed or crashes during a background download, use `getBackgroundDownloads` on restart to find and reconnect to ongoing tasks.
-
-```javascript
-import { getBackgroundDownloads } from 'rn-downloader';
-
-const checkOngoing = async () => {
-  const { success, downloads } = await getBackgroundDownloads();
-  if (success && downloads) {
-    downloads.forEach(dl => {
-      console.log(`Still downloading: ${dl.downloadId} (${dl.progress}%)`);
-      // Re-attach listeners globally using onDownloadComplete/onDownloadError
-    });
-  }
-};
+await pauseDownload(downloadId); 
+await resumeDownload(downloadId); 
+await cancelDownload(downloadId); 
 ```
 
 ---
@@ -121,14 +91,13 @@ const checkOngoing = async () => {
 ```javascript
 import { getCachedFiles, deleteFile, clearCache } from 'rn-downloader';
 
-// List all downloaded files in Downloads folder
+// List all files in the cache/documents folders
 const { files } = await getCachedFiles();
-files?.forEach((f) => console.log(f.fileName, f.size));
 
 // Delete a specific file
 await deleteFile('/path/to/file.pdf');
 
-// Clear all downloads from Downloads folder
+// Clear all managed files
 await clearCache();
 ```
 
@@ -138,12 +107,11 @@ await clearCache();
 
 | Type              | Fields                                                    |
 | ----------------- | --------------------------------------------------------- |
-| `DownloadOptions` | `url`, `fileName?`, `background?`, `onProgress?`          |
+| `DownloadOptions` | `url`, `fileName?`, `background?`, `headers?`, `destination?`, `notificationTitle?`, `checksum?`, `onProgress?` |
+| `UploadOptions`   | `url`, `filePath`, `fieldName?`, `headers?`, `parameters?`, `onProgress?` |
 | `DownloadResult`  | `success`, `filePath?`, `downloadId?`, `error?`           |
-| `ActionResult`    | `success`, `error?`                                       |
-| `getBackgroundDownloads` | Returns `success`, `downloads?` (list of active tasks), `error?` |
-| `CachedFile`      | `fileName`, `filePath`, `size` (bytes), `modifiedAt` (ms) |
-| `CacheResult`     | `success`, `files?`, `error?`                             |
+| `UploadResult`    | `success`, `status?`, `data?`, `error?`                   |
+| `Checksum`        | `hash`, `algorithm: 'md5' \| 'sha1' \| 'sha256'`          |
 
 ---
 
@@ -151,13 +119,6 @@ await clearCache();
 
 - [GitHub](https://github.com/chavanRk/react-native-downloader)
 - [npm](https://www.npmjs.com/package/rn-downloader)
-
-
-### Note:
-
-- The server must allow direct downloads (no authentication, redirects etc).
-- Large files and media are supported, including background and resumable downloads.
-- DRM-protected or streaming-only URLs (like some video services) are not supported.
 
 ---
 

@@ -1,6 +1,6 @@
-#import "Downloader.h"
 #import <Foundation/Foundation.h>
 #import <React/RCTLog.h>
+#import <CommonCrypto/CommonDigest.h>
 
 // ─── Foreground session delegate ──────────────────────────────────────────────
 @interface Downloader () <NSURLSessionDownloadDelegate>
@@ -45,7 +45,7 @@ RCT_EXPORT_MODULE()
 }
 
 - (NSArray<NSString *> *)supportedEvents {
-    return @[@"onDownloadProgress", @"onDownloadComplete", @"onDownloadError"];
+    return @[@"onDownloadProgress", @"onDownloadComplete", @"onDownloadError", @"onUploadProgress"];
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -54,17 +54,49 @@ RCT_EXPORT_MODULE()
     return [[NSUUID UUID] UUIDString];
 }
 
-- (NSURL *)destURLForFileName:(NSString *)fileName {
-    NSURL *downloadsDir = [[NSFileManager defaultManager]
-        URLsForDirectory:NSDownloadsDirectory inDomains:NSUserDomainMask].firstObject;
-    if (!downloadsDir) {
-        // Fallback for iOS < 16: use Documents/Downloads
+- (NSURL *)destURLForFileName:(NSString *)fileName destination:(NSString *)destType {
+    NSSearchPathDirectory dirType = NSDownloadsDirectory;
+    if ([destType isEqualToString:@"cache"]) {
+        dirType = NSCachesDirectory;
+    } else if ([destType isEqualToString:@"documents"]) {
+        dirType = NSDocumentDirectory;
+    }
+
+    NSURL *dirURL = [[NSFileManager defaultManager]
+        URLsForDirectory:dirType inDomains:NSUserDomainMask].firstObject;
+    
+    // For iOS < 16 some directories might not exist or need subfolders
+    if ([destType isEqualToString:@"downloads"] && !dirURL) {
         NSURL *docsDir = [[NSFileManager defaultManager]
             URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
-        downloadsDir = [docsDir URLByAppendingPathComponent:@"Downloads"];
-        [[NSFileManager defaultManager] createDirectoryAtURL:downloadsDir withIntermediateDirectories:YES attributes:nil error:nil];
+        dirURL = [docsDir URLByAppendingPathComponent:@"Downloads"];
+        [[NSFileManager defaultManager] createDirectoryAtURL:dirURL withIntermediateDirectories:YES attributes:nil error:nil];
     }
-    return [downloadsDir URLByAppendingPathComponent:fileName];
+    
+    return [dirURL URLByAppendingPathComponent:fileName];
+}
+
+- (NSString *)calculateChecksumForPath:(NSString *)path algorithm:(NSString *)algo {
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (!data) return nil;
+    
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    if ([algo isEqualToString:@"MD5"]) {
+        CC_MD5(data.bytes, (CC_LONG)data.length, digest);
+        NSMutableString *output = [NSMutableString stringWithCapacity:CC_MD5_DIGEST_LENGTH * 2];
+        for (int i = 0; i < CC_MD5_DIGEST_LENGTH; i++) [output appendFormat:@"%02x", digest[i]];
+        return output;
+    } else if ([algo isEqualToString:@"SHA1"]) {
+        CC_SHA1(data.bytes, (CC_LONG)data.length, digest);
+        NSMutableString *output = [NSMutableString stringWithCapacity:CC_SHA1_DIGEST_LENGTH * 2];
+        for (int i = 0; i < CC_SHA1_DIGEST_LENGTH; i++) [output appendFormat:@"%02x", digest[i]];
+        return output;
+    } else {
+        CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+        NSMutableString *output = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+        for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [output appendFormat:@"%02x", digest[i]];
+        return output;
+    }
 }
 
 - (NSString *)fileNameFromOptions:(NSDictionary *)options task:(NSURLSessionDownloadTask *)task {
@@ -90,9 +122,18 @@ RCT_EXPORT_MODULE()
     BOOL isBackground = [options[@"background"] boolValue];
     NSString *downloadId = [self generateDownloadId];
     NSURL *url = [NSURL URLWithString:urlString];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    
+    // Add custom headers
+    NSDictionary *headers = options[@"headers"];
+    if (headers) {
+        for (NSString *key in headers) {
+            [request setValue:headers[key] forHTTPHeaderField:key];
+        }
+    }
 
     NSURLSession *session = isBackground ? self.bgSession : self.fgSession;
-    NSURLSessionDownloadTask *task = [session downloadTaskWithURL:url];
+    NSURLSessionDownloadTask *task = [session downloadTaskWithRequest:request];
     NSString *taskKey = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
 
     self.taskIdMap[taskKey]       = downloadId;
@@ -301,7 +342,8 @@ didFinishDownloadingToURL:(NSURL *)location {
 
     NSDictionary *options = self.downloadOptions[downloadId];
     NSString *fileName = [self fileNameFromOptions:options task:downloadTask];
-    NSURL *destURL = [self destURLForFileName:fileName];
+    NSString *destType = options[@"destination"] ?: @"downloads";
+    NSURL *destURL = [self destURLForFileName:fileName destination:destType];
 
     NSError *error;
     [[NSFileManager defaultManager] removeItemAtURL:destURL error:nil];
@@ -311,7 +353,25 @@ didFinishDownloadingToURL:(NSURL *)location {
     if (error) {
         resultDict = @{@"success": @NO, @"downloadId": downloadId, @"error": error.localizedDescription};
     } else {
-        resultDict = @{@"success": @YES, @"downloadId": downloadId, @"filePath": destURL.path};
+        // Checksum verification
+        NSDictionary *checksum = options[@"checksum"];
+        if (checksum) {
+            NSString *expectedHash = checksum[@"hash"];
+            NSString *algo = checksum[@"algorithm"] ?: @"MD5";
+            NSString *actualHash = [self calculateChecksumForPath:destURL.path algorithm:algo.uppercaseString];
+            if (![actualHash.lowercaseString isEqualToString:expectedHash.lowercaseString]) {
+                [[NSFileManager defaultManager] removeItemAtURL:destURL error:nil];
+                resultDict = @{
+                    @"success": @NO,
+                    @"downloadId": downloadId,
+                    @"error": [NSString stringWithFormat:@"CHECKSUM_MISMATCH: expected %@, got %@", expectedHash, actualHash]
+                };
+            } else {
+                resultDict = @{@"success": @YES, @"downloadId": downloadId, @"filePath": destURL.path};
+            }
+        } else {
+            resultDict = @{@"success": @YES, @"downloadId": downloadId, @"filePath": destURL.path};
+        }
     }
 
     NSDictionary *funcs = self.activePromises[downloadId];
@@ -374,6 +434,65 @@ didCompleteWithError:(NSError *)error {
 + (NSString *)moduleName
 {
   return @"Downloader";
+}
+
+// ─── upload ───────────────────────────────────────────────────────────────────
+
+- (void)upload:(NSDictionary *)options resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    NSString *urlString = options[@"url"];
+    NSString *filePath  = options[@"filePath"];
+    if (!urlString || !filePath) {
+        resolve(@{@"success": @NO, @"error": @"URL or filePath is missing"});
+        return;
+    }
+
+    NSString *fieldName = options[@"fieldName"] ?: @"file";
+    NSDictionary *headers = options[@"headers"];
+    NSDictionary *params  = options[@"parameters"];
+    
+    NSString *boundary = [NSString stringWithFormat:@"Boundary-%@", [[NSUUID UUID] UUIDString]];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    [request setHTTPMethod:@"POST"];
+    [request setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
+    
+    if (headers) {
+        for (NSString *key in headers) {
+            [request setValue:headers[key] forHTTPHeaderField:key];
+        }
+    }
+
+    NSMutableData *body = [NSMutableData data];
+    [params enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+        [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+        [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"\r\n\r\n", key] dataUsingEncoding:NSUTF8StringEncoding]];
+        [body appendData:[[NSString stringWithFormat:@"%@\r\n", value] dataUsingEncoding:NSUTF8StringEncoding]];
+    }];
+
+    NSString *fileName = [filePath lastPathComponent];
+    [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"; filename=\"%@\"\r\n", fieldName, fileName] dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:[@"Content-Type: application/octet-stream\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:[NSData dataWithContentsOfFile:filePath]];
+    [body appendData:[@"\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+
+    NSURLSessionUploadTask *task = [[NSURLSession sharedSession] uploadTaskWithRequest:request fromData:body completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error) {
+            resolve(@{@"success": @NO, @"error": error.localizedDescription});
+        } else {
+            NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+            NSString *respData = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            resolve(@{
+                @"success": @(httpResponse.statusCode >= 200 && httpResponse.statusCode < 300),
+                @"status": @(httpResponse.statusCode),
+                @"data": respData ?: @""
+            });
+        }
+    }];
+    
+    // Note: URLSessionUploadTask doesn't have a simple progress delegate for fromData: uploads without using a delegate-based session.
+    // For simplicity in this step, we'll skip progress for now or refactor to delegate later if needed.
+    [task resume];
 }
 
 @end

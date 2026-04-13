@@ -10,10 +10,12 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
@@ -53,6 +55,30 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
     return name.ifBlank { "downloaded_file" }
   }
 
+  private fun getDestinationFile(fileName: String, destination: String?): File {
+    return when (destination) {
+      "cache" -> File(reactContext.cacheDir, fileName)
+      "documents" -> File(reactContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS), fileName)
+      else -> File(
+        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+        fileName
+      )
+    }
+  }
+
+  private fun calculateChecksum(file: File, algorithm: String): String {
+    val digest = MessageDigest.getInstance(algorithm)
+    val fis = FileInputStream(file)
+    val buffer = ByteArray(8192)
+    var count: Int
+    while (fis.read(buffer).also { count = it } != -1) {
+      digest.update(buffer, 0, count)
+    }
+    fis.close()
+    val bytes = digest.digest()
+    return bytes.joinToString("") { "%02x".format(it) }
+  }
+
   // ─── download ──────────────────────────────────────────────────────────────
 
   override fun download(options: ReadableMap, promise: Promise) {
@@ -69,6 +95,12 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
     val fileName = resolveFileName(urlString, rawFileName)
     val downloadId = UUID.randomUUID().toString()
 
+    val headersMap = options.getMap("headers")
+    val destination = options.takeIf { it.hasKey("destination") }?.getString("destination")
+    val notificationTitle = options.takeIf { it.hasKey("notificationTitle") }?.getString("notificationTitle")
+    val notificationDesc = options.takeIf { it.hasKey("notificationDescription") }?.getString("notificationDescription")
+    val checksumMap = options.takeIf { it.hasKey("checksum") }?.getMap("checksum")
+
     val state = DownloadState(url = urlString, fileName = fileName, isBackground = isBackground)
     activeDownloads[downloadId] = state
 
@@ -76,11 +108,21 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
       // Use system DownloadManager — survives process death
       val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
       val request = DownloadManager.Request(Uri.parse(urlString)).apply {
-        setTitle(fileName)
-        setDescription("rn-downloader-id:$downloadId")
+        setTitle(notificationTitle ?: fileName)
+        setDescription(notificationDesc ?: "rn-downloader-id:$downloadId")
         setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-        val dest = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), fileName)
-        setDestinationUri(Uri.fromFile(dest))
+
+        // Add headers
+        headersMap?.toHashMap()?.forEach { (key, value) ->
+          if (value is String) addRequestHeader(key, value)
+        }
+
+        // Set destination
+        when (destination) {
+          "cache" -> setDestinationInExternalFilesDir(reactContext, null, fileName) // No specific 'cache' directory in DownloadManager, use files
+          "documents" -> setDestinationInExternalFilesDir(reactContext, Environment.DIRECTORY_DOCUMENTS, fileName)
+          else -> setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+        }
       }
       val bgId = dm.enqueue(request)
       bgDownloadIds[downloadId] = bgId
@@ -102,10 +144,16 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
     thread {
       try {
         var resumeFrom = state.bytesDownloaded
-        val destFile = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), fileName)
+        val destFile = getDestinationFile(fileName, destination)
 
         val url = URL(urlString)
         val connection = url.openConnection() as HttpURLConnection
+
+        // Add custom headers
+        headersMap?.toHashMap()?.forEach { (key, value) ->
+          if (value is String) connection.setRequestProperty(key, value)
+        }
+
         if (resumeFrom > 0) {
           connection.setRequestProperty("Range", "bytes=$resumeFrom-")
         }
@@ -170,6 +218,25 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
 
         output.flush(); output.close(); input.close()
         activeDownloads.remove(downloadId)
+
+        // Checksum verification
+        if (checksumMap != null) {
+          val expectedHash = checksumMap.getString("hash")
+          val algorithm = checksumMap.getString("algorithm")?.uppercase() ?: "MD5"
+          if (expectedHash != null) {
+            val actualHash = calculateChecksum(destFile, algorithm)
+            if (!actualHash.equals(expectedHash, ignoreCase = true)) {
+              destFile.delete()
+              val err = Arguments.createMap().apply {
+                putBoolean("success", false)
+                putString("downloadId", downloadId)
+                putString("error", "CHECKSUM_MISMATCH: expected $expectedHash, got $actualHash")
+              }
+              emit("onDownloadError", err)
+              return@thread
+            }
+          }
+        }
 
         val result = Arguments.createMap().apply {
           putBoolean("success", true)
@@ -333,6 +400,120 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", false); putString("error", e.message ?: "ERROR")
       })
+    }
+  }
+
+  // ─── upload ──────────────────────────────────────────────────────────────────
+
+  override fun upload(options: ReadableMap, promise: Promise) {
+    val urlString = options.getString("url")
+    val filePath = options.getString("filePath")
+    if (urlString.isNullOrBlank() || filePath.isNullOrBlank()) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false); putString("error", "URL or filePath is missing")
+      })
+      return
+    }
+
+    val fieldName = if (options.hasKey("fieldName")) options.getString("fieldName") else "file"
+    val headersMap = options.getMap("headers")
+    val paramsMap = options.getMap("parameters")
+
+    thread {
+      try {
+        val file = File(filePath)
+        if (!file.exists()) {
+          promise.resolve(Arguments.createMap().apply {
+            putBoolean("success", false); putString("error", "File not found")
+          })
+          return@thread
+        }
+
+        val boundary = "Boundary-${UUID.randomUUID()}"
+        val lineEnd = "\r\n"
+        val twoHyphens = "--"
+
+        val url = URL(urlString)
+        val connection = url.openConnection() as HttpURLConnection
+        connection.doInput = true
+        connection.doOutput = true
+        connection.useCaches = false
+        connection.requestMethod = "POST"
+        connection.setRequestProperty("Connection", "Keep-Alive")
+        connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+
+        // Add custom headers
+        headersMap?.toHashMap()?.forEach { (key, value) ->
+          if (value is String) connection.setRequestProperty(key, value)
+        }
+
+        val output = connection.outputStream
+        val writer = output.bufferedWriter()
+
+        // Add form parameters
+        paramsMap?.toHashMap()?.forEach { (key, value) ->
+          writer.write(twoHyphens + boundary + lineEnd)
+          writer.write("Content-Disposition: form-data; name=\"$key\"" + lineEnd)
+          writer.write("Content-Type: text/plain; charset=UTF-8" + lineEnd + lineEnd)
+          writer.write(value.toString() + lineEnd)
+        }
+
+        // Add file
+        writer.write(twoHyphens + boundary + lineEnd)
+        writer.write("Content-Disposition: form-data; name=\"$fieldName\"; filename=\"${file.name}\"" + lineEnd)
+        writer.write("Content-Type: application/octet-stream" + lineEnd + lineEnd)
+        writer.flush()
+
+        val fileInput = FileInputStream(file)
+        val buffer = ByteArray(8192)
+        var bytesRead: Int
+        var totalUploaded = 0L
+        val fileSize = file.length()
+        var lastProgress = -1
+
+        while (fileInput.read(buffer).also { bytesRead = it } != -1) {
+          output.write(buffer, 0, bytesRead)
+          totalUploaded += bytesRead
+          
+          if (fileSize > 0) {
+            val progress = (totalUploaded * 100 / fileSize).toInt()
+            if (progress > lastProgress) {
+              lastProgress = progress
+              val evt = Arguments.createMap().apply {
+                putString("url", urlString)
+                putInt("progress", progress)
+              }
+              emit("onUploadProgress", evt)
+            }
+          }
+        }
+        output.flush()
+        writer.write(lineEnd)
+        writer.write(twoHyphens + boundary + twoHyphens + lineEnd)
+        writer.flush()
+        writer.close()
+        fileInput.close()
+
+        val responseCode = connection.responseCode
+        val responseBody = if (responseCode in 200..299) {
+          connection.inputStream.bufferedReader().use { it.readText() }
+        } else {
+          connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+        }
+
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", responseCode in 200..299)
+          putInt("status", responseCode)
+          putString("data", responseBody)
+          if (responseCode !in 200..299) putString("error", "HTTP $responseCode")
+        })
+
+      } catch (e: Exception) {
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("error", e.message ?: "UPLOAD_ERROR")
+        })
+      }
     }
   }
 

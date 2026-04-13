@@ -19,7 +19,40 @@ export interface DownloadOptions {
    * and `onDownloadError` events instead of awaiting the promise.
    */
   background?: boolean;
+  /** Custom request headers (e.g. Authorization) */
+  headers?: Record<string, string>;
+  /**
+   * Destination directory for the downloaded file.
+   * - 'downloads': Public Downloads folder (default)
+   * - 'cache': App-private cache directory (cleared by OS when space is low)
+   * - 'documents': App-private documents directory (persisted)
+   */
+  destination?: 'downloads' | 'cache' | 'documents';
+  /** Android only: custom title for the system download notification */
+  notificationTitle?: string;
+  /** Android only: custom description for the system download notification */
+  notificationDescription?: string;
+  /** Optional checksum verification after download completes */
+  checksum?: {
+    hash: string;
+    algorithm: 'md5' | 'sha1' | 'sha256';
+  };
   /** Called with progress 0–100 during foreground downloads */
+  onProgress?: (percent: number) => void;
+}
+
+export interface UploadOptions {
+  /** Remote URL to upload to */
+  url: string;
+  /** Absolute local path of the file to upload */
+  filePath: string;
+  /** Multi-part field name for the file (default: 'file') */
+  fieldName?: string;
+  /** Custom request headers */
+  headers?: Record<string, string>;
+  /** Additional text parameters for the multi-part request */
+  parameters?: Record<string, string>;
+  /** Called with progress 0–100 during upload */
   onProgress?: (percent: number) => void;
 }
 
@@ -29,6 +62,17 @@ export interface DownloadResult {
   filePath?: string;
   /** Unique ID for this download — use with pause/resume/cancel */
   downloadId?: string;
+  /** Error message if success is false */
+  error?: string;
+}
+
+export interface UploadResult {
+  success: boolean;
+  /** HTTP response status code */
+  status?: number;
+  /** HTTP response body as string (if any) */
+  data?: string;
+  /** Error message if success is false */
   error?: string;
 }
 
@@ -84,6 +128,11 @@ export async function download(
       url: options.url,
       fileName: options.fileName,
       background: options.background ?? false,
+      headers: options.headers ?? {},
+      destination: options.destination ?? 'downloads',
+      notificationTitle: options.notificationTitle,
+      notificationDescription: options.notificationDescription,
+      checksum: options.checksum,
     });
 
     if (progressSubscription) {
@@ -91,6 +140,48 @@ export async function download(
     }
 
     return result as DownloadResult;
+  } catch (error: any) {
+    if (progressSubscription) {
+      progressSubscription.remove();
+    }
+    return { success: false, error: error?.message || 'UNKNOWN_ERROR' };
+  }
+}
+
+// ─── Core upload ──────────────────────────────────────────────────────────────
+
+/**
+ * Upload a file using multipart/form-data.
+ */
+export async function upload(options: UploadOptions): Promise<UploadResult> {
+  let progressSubscription: ReturnType<typeof eventEmitter.addListener> | null =
+    null;
+
+  if (options.onProgress) {
+    progressSubscription = eventEmitter.addListener(
+      'onUploadProgress',
+      (event: any) => {
+        if (event.url === options.url && options.onProgress) {
+          options.onProgress(event.progress);
+        }
+      }
+    );
+  }
+
+  try {
+    const result = await (DownloaderSpec as any).upload({
+      url: options.url,
+      filePath: options.filePath,
+      fieldName: options.fieldName ?? 'file',
+      headers: options.headers ?? {},
+      parameters: options.parameters ?? {},
+    });
+
+    if (progressSubscription) {
+      progressSubscription.remove();
+    }
+
+    return result as UploadResult;
   } catch (error: any) {
     if (progressSubscription) {
       progressSubscription.remove();
@@ -228,4 +319,15 @@ export function onDownloadError(
   return () => sub.remove();
 }
 
-export default { download };
+/**
+ * Subscribe to upload progress events.
+ * Returns an unsubscribe function.
+ */
+export function onUploadProgress(
+  callback: (result: { url: string; progress: number }) => void
+): () => void {
+  const sub = eventEmitter.addListener('onUploadProgress', callback as any);
+  return () => sub.remove();
+}
+
+export default { download, upload };
