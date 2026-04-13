@@ -8,6 +8,7 @@ export interface Spec extends TurboModule {
   getCachedFiles(): Promise<Object>;
   deleteFile(filePath: string): Promise<Object>;
   clearCache(): Promise<Object>;
+  getBackgroundDownloads(): Promise<Object>;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('Downloader');

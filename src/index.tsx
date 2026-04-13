@@ -183,6 +183,27 @@ export async function clearCache(): Promise<ActionResult> {
   }
 }
 
+/**
+ * Get all active background downloads.
+ * Use this after app restart to "re-attach" to ongoing downloads.
+ */
+export async function getBackgroundDownloads(): Promise<{
+  success: boolean;
+  downloads?: Array<{
+    downloadId: string;
+    url: string;
+    status: number;
+    progress: number;
+  }>;
+  error?: string;
+}> {
+  try {
+    return (await (DownloaderSpec as any).getBackgroundDownloads()) as any;
+  } catch (error: any) {
+    return { success: false, error: error?.message || 'UNKNOWN_ERROR' };
+  }
+}
+
 // ─── Event helpers ────────────────────────────────────────────────────────────
 
 /**

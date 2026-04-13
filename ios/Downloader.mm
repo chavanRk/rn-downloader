@@ -98,6 +98,7 @@ RCT_EXPORT_MODULE()
     self.taskIdMap[taskKey]       = downloadId;
     self.activeTasks[downloadId]  = task;
     self.downloadOptions[downloadId] = options;
+    task.taskDescription = downloadId;
 
     if (isBackground) {
         // Resolve immediately with the downloadId — result comes via event
@@ -246,6 +247,31 @@ RCT_EXPORT_MODULE()
         [[NSFileManager defaultManager] removeItemAtURL:fileURL error:nil];
     }
     resolve(@{@"success": @YES});
+}
+
+// ─── getBackgroundDownloads ───────────────────────────────────────────────────
+
+- (void)getBackgroundDownloads:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    [self.bgSession getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) {
+        NSMutableArray *results = [NSMutableArray new];
+        for (NSURLSessionDownloadTask *task in downloadTasks) {
+            NSString *downloadId = task.taskDescription ?: @"";
+            NSString *url = task.originalRequest.URL.absoluteString ?: @"";
+            
+            int progress = 0;
+            if (task.countOfBytesExpectedToReceive > 0) {
+                progress = (int)((task.countOfBytesReceived * 100) / task.countOfBytesExpectedToReceive);
+            }
+            
+            [results addObject:@{
+                @"downloadId": downloadId,
+                @"url": url,
+                @"status": @(task.state), // 0=Running, 1=Suspended, 2=Canceling, 3=Completed
+                @"progress": @(progress)
+            }];
+        }
+        resolve(@{@"success": @YES, @"downloads": results});
+    }];
 }
 
 // ─── NSURLSession delegates ───────────────────────────────────────────────────

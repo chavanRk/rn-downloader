@@ -77,7 +77,7 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
       val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
       val request = DownloadManager.Request(Uri.parse(urlString)).apply {
         setTitle(fileName)
-        setDescription("Downloading $fileName")
+        setDescription("rn-downloader-id:$downloadId")
         setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
         val dest = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), fileName)
         setDestinationUri(Uri.fromFile(dest))
@@ -280,6 +280,55 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
       val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
       downloadsDir.listFiles()?.forEach { it.delete() }
       promise.resolve(Arguments.createMap().apply { putBoolean("success", true) })
+    } catch (e: Exception) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false); putString("error", e.message ?: "ERROR")
+      })
+    }
+  }
+
+  // ─── getBackgroundDownloads ──────────────────────────────────────────────────
+
+  override fun getBackgroundDownloads(promise: Promise) {
+    try {
+      val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+      val query = DownloadManager.Query()
+      // We check for all states that could still be in progress or completed but not yet handled
+      val cursor = dm.query(query)
+      val results = Arguments.createArray()
+
+      if (cursor != null && cursor.moveToFirst()) {
+        val descIdx = cursor.getColumnIndex(DownloadManager.COLUMN_DESCRIPTION)
+        val idIdx = cursor.getColumnIndex(DownloadManager.COLUMN_ID)
+        val statusIdx = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
+        val uriIdx = cursor.getColumnIndex(DownloadManager.COLUMN_URI)
+        val totalIdx = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+        val currentIdx = cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+
+        do {
+          val description = cursor.getString(descIdx) ?: ""
+          if (description.startsWith("rn-downloader-id:")) {
+            val downloadId = description.removePrefix("rn-downloader-id:")
+            val status = cursor.getInt(statusIdx)
+            val total = cursor.getLong(totalIdx)
+            val current = cursor.getLong(currentIdx)
+            val progress = if (total > 0) (current * 100 / total).toInt() else 0
+
+            results.pushMap(Arguments.createMap().apply {
+              putString("downloadId", downloadId)
+              putString("url", cursor.getString(uriIdx))
+              putInt("status", status)
+              putInt("progress", progress)
+            })
+          }
+        } while (cursor.moveToNext())
+        cursor.close()
+      }
+
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", true)
+        putArray("downloads", results)
+      })
     } catch (e: Exception) {
       promise.resolve(Arguments.createMap().apply {
         putBoolean("success", false); putString("error", e.message ?: "ERROR")

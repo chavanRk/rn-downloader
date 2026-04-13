@@ -10,10 +10,12 @@ The easiest way to download files in React Native — with background support, p
 - 🌙 **Background downloads** — survive app suspension (iOS background URLSession + Android DownloadManager)
 - ⏸ **Pause & Resume** — resume mid-download using HTTP Range requests
 - ❌ **Cancel** — cancel any active download, partial files are cleaned up automatically
+- 🔄 **Re-attach** — reconnect to background downloads after app restart
+- 📱 **Expo Support** — includes a config plugin for zero-config integration
+- ⚡ **TurboModules** — built on the React Native New Architecture
 - 📦 **File management** — list, delete individual files, or clear all downloads from Downloads folder
 - 📂 **Smart file naming** — auto-detects filename from URL if not provided
-- 🛠 **Structured errors** — `{ success: false, error: '...' }` instead of silent failures
-- ⚡ **Lightweight** — zero dependencies
+- ⚡ **Lightweight** — zero base dependencies
 
 ---
 
@@ -25,7 +27,19 @@ npm install rn-downloader
 yarn add rn-downloader
 ```
 
-> iOS: run `pod install` in your `ios/` directory after installing.
+```
+
+### 🍎 Expo Installation
+Add the plugin to your `app.json` or `app.config.js`:
+```json
+{
+  "expo": {
+    "plugins": ["rn-downloader"]
+  }
+}
+```
+
+> iOS: For bare projects, run `pod install` in your `ios/` directory after installing.
 
 ---
 
@@ -82,6 +96,26 @@ await cancelDownload(downloadId); // cancel + delete partial file
 
 ---
 
+### Re-attach (Background Persistence)
+
+If the app is closed or crashes during a background download, use `getBackgroundDownloads` on restart to find and reconnect to ongoing tasks.
+
+```javascript
+import { getBackgroundDownloads } from 'rn-downloader';
+
+const checkOngoing = async () => {
+  const { success, downloads } = await getBackgroundDownloads();
+  if (success && downloads) {
+    downloads.forEach(dl => {
+      console.log(`Still downloading: ${dl.downloadId} (${dl.progress}%)`);
+      // Re-attach listeners globally using onDownloadComplete/onDownloadError
+    });
+  }
+};
+```
+
+---
+
 ### Cache Management
 
 ```javascript
@@ -107,6 +141,7 @@ await clearCache();
 | `DownloadOptions` | `url`, `fileName?`, `background?`, `onProgress?`          |
 | `DownloadResult`  | `success`, `filePath?`, `downloadId?`, `error?`           |
 | `ActionResult`    | `success`, `error?`                                       |
+| `getBackgroundDownloads` | Returns `success`, `downloads?` (list of active tasks), `error?` |
 | `CachedFile`      | `fileName`, `filePath`, `size` (bytes), `modifiedAt` (ms) |
 | `CacheResult`     | `success`, `files?`, `error?`                             |
 
