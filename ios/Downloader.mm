@@ -314,6 +314,219 @@ RCT_EXPORT_MODULE()
     resolve(@{@"success": @YES});
 }
 
+// ─── exists ──────────────────────────────────────────────────────────────────
+
+- (void)exists:(NSString *)filePath resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    @try {
+        BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:filePath];
+        resolve(@{
+            @"success": @YES,
+            @"exists": @(exists)
+        });
+    } @catch (NSException *exception) {
+        resolve(@{
+            @"success": @NO,
+            @"error": exception.reason ?: @"EXISTS_ERROR"
+        });
+    }
+}
+
+// ─── stat ────────────────────────────────────────────────────────────────────
+
+- (void)stat:(NSString *)filePath resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        BOOL isDir = NO;
+        BOOL exists = [fm fileExistsAtPath:filePath isDirectory:&isDir];
+        if (!exists) {
+            resolve(@{@"success": @NO, @"error": @"Path does not exist"});
+            return;
+        }
+
+        NSDictionary *attrs = [fm attributesOfItemAtPath:filePath error:nil];
+        NSNumber *size = attrs[NSFileSize] ?: @0;
+        NSDate *modDate = attrs[NSFileModificationDate] ?: [NSDate dateWithTimeIntervalSince1970:0];
+
+        resolve(@{
+            @"success": @YES,
+            @"stat": @{
+                @"path": filePath,
+                @"name": [filePath lastPathComponent] ?: @"",
+                @"isDir": @(isDir),
+                @"size": isDir ? @0 : size,
+                @"modified": @((long long)([modDate timeIntervalSince1970] * 1000))
+            }
+        });
+    } @catch (NSException *exception) {
+        resolve(@{
+            @"success": @NO,
+            @"error": exception.reason ?: @"STAT_ERROR"
+        });
+    }
+}
+
+// ─── readFile ────────────────────────────────────────────────────────────────
+
+- (void)readFile:(NSString *)filePath encoding:(NSString *)encoding resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:filePath isDirectory:&isDir] || isDir) {
+        resolve(@{@"success": @NO, @"error": [NSString stringWithFormat:@"File not found: %@", filePath]});
+        return;
+    }
+
+    NSError *readError = nil;
+    NSData *raw = [NSData dataWithContentsOfFile:filePath options:0 error:&readError];
+    if (!raw || readError) {
+        resolve(@{@"success": @NO, @"error": readError.localizedDescription ?: @"READ_FILE_ERROR"});
+        return;
+    }
+
+    NSString *dataString = nil;
+    if ([[encoding lowercaseString] isEqualToString:@"base64"]) {
+        dataString = [raw base64EncodedStringWithOptions:0];
+    } else {
+        dataString = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
+        if (!dataString) {
+            resolve(@{@"success": @NO, @"error": @"File is not valid UTF-8. Try base64 encoding."});
+            return;
+        }
+    }
+
+    resolve(@{
+        @"success": @YES,
+        @"data": dataString ?: @""
+    });
+}
+
+// ─── writeFile ───────────────────────────────────────────────────────────────
+
+- (void)writeFile:(NSString *)filePath data:(NSString *)data encoding:(NSString *)encoding resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *parent = [filePath stringByDeletingLastPathComponent];
+    if (parent.length > 0) {
+        [fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+
+    NSError *writeError = nil;
+    BOOL success = NO;
+
+    if ([[encoding lowercaseString] isEqualToString:@"base64"]) {
+        NSData *decoded = [[NSData alloc] initWithBase64EncodedString:data options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        if (!decoded) {
+            resolve(@{@"success": @NO, @"error": @"Invalid base64 string"});
+            return;
+        }
+        success = [decoded writeToFile:filePath options:NSDataWritingAtomic error:&writeError];
+    } else {
+        success = [data writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:&writeError];
+    }
+
+    if (!success || writeError) {
+        resolve(@{@"success": @NO, @"error": writeError.localizedDescription ?: @"WRITE_FILE_ERROR"});
+        return;
+    }
+
+    resolve(@{@"success": @YES});
+}
+
+// ─── copyFile ────────────────────────────────────────────────────────────────
+
+- (void)copyFile:(NSString *)fromPath toPath:(NSString *)toPath resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:fromPath isDirectory:&isDir] || isDir) {
+        resolve(@{@"success": @NO, @"error": [NSString stringWithFormat:@"Source file not found: %@", fromPath]});
+        return;
+    }
+
+    NSString *parent = [toPath stringByDeletingLastPathComponent];
+    if (parent.length > 0) {
+        [fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+
+    [fm removeItemAtPath:toPath error:nil];
+    NSError *copyError = nil;
+    BOOL success = [fm copyItemAtPath:fromPath toPath:toPath error:&copyError];
+
+    if (!success || copyError) {
+        resolve(@{@"success": @NO, @"error": copyError.localizedDescription ?: @"COPY_FILE_ERROR"});
+        return;
+    }
+
+    resolve(@{@"success": @YES});
+}
+
+// ─── moveFile ────────────────────────────────────────────────────────────────
+
+- (void)moveFile:(NSString *)fromPath toPath:(NSString *)toPath resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:fromPath]) {
+        resolve(@{@"success": @NO, @"error": [NSString stringWithFormat:@"Source path not found: %@", fromPath]});
+        return;
+    }
+
+    NSString *parent = [toPath stringByDeletingLastPathComponent];
+    if (parent.length > 0) {
+        [fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+
+    [fm removeItemAtPath:toPath error:nil];
+    NSError *moveError = nil;
+    BOOL success = [fm moveItemAtPath:fromPath toPath:toPath error:&moveError];
+
+    if (!success || moveError) {
+        resolve(@{@"success": @NO, @"error": moveError.localizedDescription ?: @"MOVE_FILE_ERROR"});
+        return;
+    }
+
+    resolve(@{@"success": @YES});
+}
+
+// ─── mkdir ───────────────────────────────────────────────────────────────────
+
+- (void)mkdir:(NSString *)dirPath resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    BOOL exists = [fm fileExistsAtPath:dirPath isDirectory:&isDir];
+    if (exists && isDir) {
+        resolve(@{@"success": @YES});
+        return;
+    }
+
+    NSError *mkdirError = nil;
+    BOOL success = [fm createDirectoryAtPath:dirPath withIntermediateDirectories:YES attributes:nil error:&mkdirError];
+    if (!success || mkdirError) {
+        resolve(@{@"success": @NO, @"error": mkdirError.localizedDescription ?: @"MKDIR_ERROR"});
+        return;
+    }
+
+    resolve(@{@"success": @YES});
+}
+
+// ─── ls ──────────────────────────────────────────────────────────────────────
+
+- (void)ls:(NSString *)dirPath resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:dirPath isDirectory:&isDir] || !isDir) {
+        resolve(@{@"success": @NO, @"error": [NSString stringWithFormat:@"Directory not found: %@", dirPath]});
+        return;
+    }
+
+    NSError *lsError = nil;
+    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:dirPath error:&lsError];
+    if (lsError) {
+        resolve(@{@"success": @NO, @"error": lsError.localizedDescription ?: @"LS_ERROR"});
+        return;
+    }
+
+    resolve(@{
+        @"success": @YES,
+        @"entries": entries ?: @[]
+    });
+}
+
 // ─── getBackgroundDownloads ───────────────────────────────────────────────────
 
 - (void)getBackgroundDownloads:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {

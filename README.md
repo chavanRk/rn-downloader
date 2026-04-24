@@ -6,11 +6,11 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg?style=flat-square)](https://www.typescriptlang.org/)
 [![platforms](https://img.shields.io/badge/platforms-iOS%20%7C%20Android-lightgrey.svg?style=flat-square)](https://github.com/chavan-labs/rn-downloader)
 
-The easiest way to download files in React Native — with background support, pause/resume, upload, and cache management built-in.
+The easiest way to download **and manage files** in React Native — with background support, pause/resume, upload, queueing, and built-in filesystem APIs.
 
 > 100% pure native code (Kotlin + Swift). Zero third-party dependencies.
 
-**Keywords:** react native download, react native file download, react native background download, react native download manager, react native file upload, react native download progress, react native pause resume download, react native cache manager, react native turbo module, expo download, iOS URLSession, Android DownloadManager, react native checksum validation, base64 converter, url to base64, data uri, share file, open file, file sharing, native share, document viewer
+**Keywords:** react native download, react native file download, react native background download, react native download manager, react native file upload, react native download progress, react native pause resume download, react native cache manager, react native turbo module, expo download, iOS URLSession, Android DownloadManager, react native checksum validation, base64 converter, url to base64, data uri, share file, open file, file sharing, native share, document viewer, download queue, concurrent downloads, queue concurrency, priority queue, batch download, max concurrent downloads, react native filesystem, read file, write file, copy file, move file, stat file, file exists
 
 ⭐ **Star this repo if you found it useful** — it helps others discover the project!
 
@@ -21,6 +21,8 @@ Most React Native file download solutions have one or more of these problems:
 - **Complexity** — require configuring native modules, background tasks, and notification channels separately
 - **Dependencies** — rely on heavy third-party libraries that bloat your app size
 - **Limited features** — lack pause/resume, checksum validation, or proper background support
+- **No queue** — spawn 20 downloads and you'll crash or saturate the network; libraries like `react-native-blob-util` have no queue at all
+- **Split libraries** — downloading is in one package, filesystem operations in another (read/write/copy/stat/exists), adding extra dependency and complexity
 - **Poor DX** — complicated APIs that require managing multiple IDs, listeners, and cleanup logic
 
 **rn-downloader** was built to solve these issues. It provides a simple, unified API while leveraging platform-native download managers (URLSession on iOS, DownloadManager on Android) for reliable, battery-efficient downloads. Everything works out of the box — background downloads, progress tracking, pause/resume — without wrestling with native configuration.
@@ -29,6 +31,7 @@ Most React Native file download solutions have one or more of these problems:
 
 - **Download with progress** — clean `0 → 100` progress natively, no UI freezing
 - **Background downloads** — survive app suspension (iOS background URLSession + Android DownloadManager)
+- **Download Queue** — built-in concurrency-limited queue with `maxConcurrent` control and `high`/`normal` priority
 - **Pause & Resume** — resume mid-download using HTTP Range requests
 - **Auto-Retry** — automatic retry on network errors with exponential backoff
 - **Cancel** — cancel any active download, partial files are cleaned up automatically
@@ -41,6 +44,7 @@ Most React Native file download solutions have one or more of these problems:
 - **URL to Base64** — convert remote URLs (images, videos, gifs) to base64 strings
 - **Share Files** — share files with other apps using native share dialog
 - **Open Files** — open files with default apps or app chooser
+- **Filesystem API (`fs`)** — `exists`, `stat`, `readFile`, `writeFile`, `copyFile`, `moveFile`, `mkdir`, `ls`, `deleteFile`
 - **Expo Support** — includes a config plugin for zero-config integration
 - **TurboModules** — built on the React Native New Architecture
 - **File management** — list, delete individual files, or clear all downloads
@@ -87,6 +91,52 @@ const result = await download({
 > - Server errors (`4xx`/`5xx`) and checksum mismatches are **not** retried.
 > - Delay doubles each attempt (exponential backoff), capped at 30 seconds.
 > - Works on both iOS and Android for foreground downloads.
+
+---
+
+### `setQueueOptions(options)` · `getQueueStatus()` · Queue-aware `download()`
+
+Avoid crashing your app (or saturating the network) when kicking off many simultaneous downloads. The built-in queue lets you cap concurrency and prioritise individual items — all in pure JavaScript, with zero native changes required.
+
+```javascript
+import { download, setQueueOptions, getQueueStatus } from 'rn-downloader';
+
+// 1. Configure the global queue (call once, e.g. at app startup)
+setQueueOptions({ maxConcurrent: 3 }); // default is 3
+
+// 2. Enqueue downloads — at most 3 will run at the same time
+const promises = urls.map((url) =>
+  download({
+    url,
+    destination: 'documents',
+    queue: true, // join the managed queue
+    priority: 'normal', // 'high' | 'normal' (default)
+    onProgress: (p) => console.log(`${url}: ${p}%`),
+  })
+);
+
+const results = await Promise.all(promises);
+
+// High-priority item jumps ahead of all 'normal' pending items
+download({
+  url: 'https://example.com/urgent.pdf',
+  queue: true,
+  priority: 'high',
+});
+
+// 3. Inspect queue state at any time
+const { active, pending, maxConcurrent } = getQueueStatus();
+console.log(`Running: ${active}  Waiting: ${pending}  Limit: ${maxConcurrent}`);
+```
+
+> **Queue behaviour:**
+>
+> - `queue: false` (default) — download starts immediately, bypassing the queue entirely. All existing behaviour is unchanged.
+> - `queue: true` — the download is placed in the JS queue. It starts as soon as an active slot is free.
+> - `priority: 'high'` — item is inserted at the **front** of the pending list, so it runs before any `'normal'` items.
+> - `priority: 'normal'` (default) — item is appended to the **back**.
+> - `setQueueOptions` can be called at any time; if `maxConcurrent` is increased, idle slots are filled immediately.
+> - All other `DownloadOptions` (`onProgress`, `retry`, `checksum`, `headers`, etc.) work exactly the same inside the queue.
 
 ---
 
@@ -233,6 +283,36 @@ await clearCache();
 
 ---
 
+### `fs` (filesystem namespace)
+
+Use built-in file system helpers without adding another dependency.
+
+```javascript
+import { fs } from 'rn-downloader';
+
+await fs.exists('/path/to/file.pdf'); // → true/false
+
+await fs.stat('/path/to/file.pdf');
+// → { path, name, size, modified, isDir }
+
+await fs.readFile('/path/to/file.txt'); // utf8 by default
+await fs.readFile('/path/to/file.bin', 'base64');
+
+await fs.writeFile('/path/to/file.txt', 'hello');
+await fs.writeFile('/path/to/file.bin', 'SGVsbG8=', 'base64');
+
+await fs.copyFile('/src/file.pdf', '/dst/file.pdf');
+await fs.moveFile('/src/file.pdf', '/dst/file.pdf');
+await fs.deleteFile('/path/to/file.pdf');
+
+await fs.mkdir('/path/to/folder');
+await fs.ls('/path/to/folder'); // → string[]
+```
+
+> `readFile` / `writeFile` support encodings: `'utf8'` (default) and `'base64'`.
+
+---
+
 ## Use Cases
 
 ### Download from URLs
@@ -261,22 +341,27 @@ Convert base64-encoded data (like images from canvas, camera, or API responses) 
 
 ## Type Reference
 
-| Type                 | Fields                                                                                                                    |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `DownloadOptions`    | `url`, `fileName?`, `background?`, `headers?`, `destination?`, `notificationTitle?`, `checksum?`, `onProgress?`, `retry?` |
-| `RetryOptions`       | `attempts`, `delay?`, `onRetry?`                                                                                          |
-| `UploadOptions`      | `url`, `filePath`, `fieldName?`, `headers?`, `parameters?`, `onProgress?`                                                 |
-| `SaveBase64Options`  | `base64Data`, `fileName?`, `destination?`                                                                                 |
-| `UrlToBase64Options` | `url`, `headers?`                                                                                                         |
-| `ShareFileOptions`   | `filePath`, `title?`, `subject?`                                                                                          |
-| `OpenFileOptions`    | `filePath`, `mimeType?`                                                                                                   |
-| `DownloadResult`     | `success`, `filePath?`, `downloadId?`, `error?`                                                                           |
-| `UploadResult`       | `success`, `status?`, `data?`, `error?`                                                                                   |
-| `SaveBase64Result`   | `success`, `filePath?`, `error?`                                                                                          |
-| `UrlToBase64Result`  | `success`, `base64?`, `mimeType?`, `dataUri?`, `error?`                                                                   |
-| `ShareFileResult`    | `success`, `completed?`, `error?`                                                                                         |
-| `OpenFileResult`     | `success`, `error?`                                                                                                       |
-| `Checksum`           | `hash`, `algorithm: 'md5' \| 'sha1' \| 'sha256'`                                                                          |
+| Type                 | Fields                                                                                                                                           |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `DownloadOptions`    | `url`, `fileName?`, `background?`, `headers?`, `destination?`, `notificationTitle?`, `checksum?`, `onProgress?`, `retry?`, `queue?`, `priority?` |
+| `RetryOptions`       | `attempts`, `delay?`, `onRetry?`                                                                                                                 |
+| `QueueOptions`       | `maxConcurrent?`                                                                                                                                 |
+| `QueueStatus`        | `active`, `pending`, `maxConcurrent`                                                                                                             |
+| `FsEncoding`         | `'utf8' \| 'base64'`                                                                                                                             |
+| `FsStat`             | `path`, `name`, `size`, `modified`, `isDir`                                                                                                      |
+| `FsApi`              | `exists`, `stat`, `readFile`, `writeFile`, `copyFile`, `moveFile`, `deleteFile`, `mkdir`, `ls`                                                   |
+| `UploadOptions`      | `url`, `filePath`, `fieldName?`, `headers?`, `parameters?`, `onProgress?`                                                                        |
+| `SaveBase64Options`  | `base64Data`, `fileName?`, `destination?`                                                                                                        |
+| `UrlToBase64Options` | `url`, `headers?`                                                                                                                                |
+| `ShareFileOptions`   | `filePath`, `title?`, `subject?`                                                                                                                 |
+| `OpenFileOptions`    | `filePath`, `mimeType?`                                                                                                                          |
+| `DownloadResult`     | `success`, `filePath?`, `downloadId?`, `error?`                                                                                                  |
+| `UploadResult`       | `success`, `status?`, `data?`, `error?`                                                                                                          |
+| `SaveBase64Result`   | `success`, `filePath?`, `error?`                                                                                                                 |
+| `UrlToBase64Result`  | `success`, `base64?`, `mimeType?`, `dataUri?`, `error?`                                                                                          |
+| `ShareFileResult`    | `success`, `completed?`, `error?`                                                                                                                |
+| `OpenFileResult`     | `success`, `error?`                                                                                                                              |
+| `Checksum`           | `hash`, `algorithm: 'md5' \| 'sha1' \| 'sha256'`                                                                                                 |
 
 ---
 

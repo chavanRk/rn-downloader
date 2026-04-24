@@ -468,6 +468,224 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
     }
   }
 
+  // ─── exists ────────────────────────────────────────────────────────────────
+
+  override fun exists(filePath: String, promise: Promise) {
+    try {
+      val file = File(filePath)
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", true)
+        putBoolean("exists", file.exists())
+      })
+    } catch (e: Exception) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "EXISTS_ERROR")
+      })
+    }
+  }
+
+  // ─── stat ──────────────────────────────────────────────────────────────────
+
+  override fun stat(filePath: String, promise: Promise) {
+    try {
+      val file = File(filePath)
+      if (!file.exists()) {
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("error", "Path does not exist")
+        })
+        return
+      }
+
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", true)
+        putMap("stat", Arguments.createMap().apply {
+          putString("path", file.absolutePath)
+          putString("name", file.name)
+          putBoolean("isDir", file.isDirectory)
+          putDouble("size", if (file.isFile) file.length().toDouble() else 0.0)
+          putDouble("modified", file.lastModified().toDouble())
+        })
+      })
+    } catch (e: Exception) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "STAT_ERROR")
+      })
+    }
+  }
+
+  // ─── readFile ──────────────────────────────────────────────────────────────
+
+  override fun readFile(filePath: String, encoding: String, promise: Promise) {
+    try {
+      val file = File(filePath)
+      if (!file.exists() || file.isDirectory) {
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("error", "File not found: $filePath")
+        })
+        return
+      }
+
+      val data = if (encoding.equals("base64", ignoreCase = true)) {
+        android.util.Base64.encodeToString(file.readBytes(), android.util.Base64.NO_WRAP)
+      } else {
+        file.readText(Charsets.UTF_8)
+      }
+
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", true)
+        putString("data", data)
+      })
+    } catch (e: Exception) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "READ_FILE_ERROR")
+      })
+    }
+  }
+
+  // ─── writeFile ─────────────────────────────────────────────────────────────
+
+  override fun writeFile(filePath: String, data: String, encoding: String, promise: Promise) {
+    try {
+      val file = File(filePath)
+      file.parentFile?.mkdirs()
+
+      if (encoding.equals("base64", ignoreCase = true)) {
+        val bytes = android.util.Base64.decode(data, android.util.Base64.DEFAULT)
+        file.writeBytes(bytes)
+      } else {
+        file.writeText(data, Charsets.UTF_8)
+      }
+
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", true)
+      })
+    } catch (e: Exception) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "WRITE_FILE_ERROR")
+      })
+    }
+  }
+
+  // ─── copyFile ──────────────────────────────────────────────────────────────
+
+  override fun copyFile(fromPath: String, toPath: String, promise: Promise) {
+    try {
+      val src = File(fromPath)
+      if (!src.exists() || src.isDirectory) {
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("error", "Source file not found: $fromPath")
+        })
+        return
+      }
+
+      val dst = File(toPath)
+      dst.parentFile?.mkdirs()
+      src.copyTo(dst, overwrite = true)
+
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", true)
+      })
+    } catch (e: Exception) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "COPY_FILE_ERROR")
+      })
+    }
+  }
+
+  // ─── moveFile ──────────────────────────────────────────────────────────────
+
+  override fun moveFile(fromPath: String, toPath: String, promise: Promise) {
+    try {
+      val src = File(fromPath)
+      if (!src.exists()) {
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("error", "Source path not found: $fromPath")
+        })
+        return
+      }
+
+      val dst = File(toPath)
+      dst.parentFile?.mkdirs()
+
+      val renamed = src.renameTo(dst)
+      if (!renamed) {
+        if (src.isDirectory) {
+          promise.resolve(Arguments.createMap().apply {
+            putBoolean("success", false)
+            putString("error", "Moving directories is not supported")
+          })
+          return
+        }
+        src.copyTo(dst, overwrite = true)
+        src.delete()
+      }
+
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", true)
+      })
+    } catch (e: Exception) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "MOVE_FILE_ERROR")
+      })
+    }
+  }
+
+  // ─── mkdir ─────────────────────────────────────────────────────────────────
+
+  override fun mkdir(dirPath: String, promise: Promise) {
+    try {
+      val dir = File(dirPath)
+      val ok = if (dir.exists()) dir.isDirectory else dir.mkdirs()
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", ok)
+        if (!ok) putString("error", "Could not create directory: $dirPath")
+      })
+    } catch (e: Exception) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "MKDIR_ERROR")
+      })
+    }
+  }
+
+  // ─── ls ────────────────────────────────────────────────────────────────────
+
+  override fun ls(dirPath: String, promise: Promise) {
+    try {
+      val dir = File(dirPath)
+      if (!dir.exists() || !dir.isDirectory) {
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("error", "Directory not found: $dirPath")
+        })
+        return
+      }
+
+      val entries = Arguments.createArray()
+      dir.list()?.forEach { name -> entries.pushString(name) }
+
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", true)
+        putArray("entries", entries)
+      })
+    } catch (e: Exception) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("success", false)
+        putString("error", e.message ?: "LS_ERROR")
+      })
+    }
+  }
+
   // ─── getBackgroundDownloads ──────────────────────────────────────────────────
 
   override fun getBackgroundDownloads(promise: Promise) {

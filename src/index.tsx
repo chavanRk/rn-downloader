@@ -40,6 +40,19 @@ export interface DownloadOptions {
   /** Called with progress 0–100 during foreground downloads */
   onProgress?: (percent: number) => void;
   /**
+   * Join the managed download queue instead of starting immediately.
+   * Respects the `maxConcurrent` limit set via `setQueueOptions()`.
+   * Defaults to `false`.
+   */
+  queue?: boolean;
+  /**
+   * Priority inside the queue.
+   * - `'high'`: inserted at the front of the pending queue.
+   * - `'normal'` (default): appended to the back.
+   * Has no effect when `queue` is `false`.
+   */
+  priority?: 'high' | 'normal';
+  /**
    * Auto-retry on network failure with exponential backoff.
    * Only retries on network errors (timeouts, connection drops).
    * Server errors (4xx/5xx) and checksum mismatches are NOT retried.
@@ -195,17 +208,151 @@ export interface OpenFileResult {
   error?: string;
 }
 
+export type FsEncoding = 'utf8' | 'base64';
+
+export interface FsStat {
+  /** Absolute path */
+  path: string;
+  /** Basename */
+  name: string;
+  /** Size in bytes (0 for directories) */
+  size: number;
+  /** Last modified timestamp in milliseconds */
+  modified: number;
+  /** Whether path is a directory */
+  isDir: boolean;
+}
+
+export interface FsApi {
+  exists: (filePath: string) => Promise<boolean>;
+  stat: (filePath: string) => Promise<FsStat>;
+  readFile: (filePath: string, encoding?: FsEncoding) => Promise<string>;
+  writeFile: (
+    filePath: string,
+    data: string,
+    encoding?: FsEncoding
+  ) => Promise<void>;
+  copyFile: (fromPath: string, toPath: string) => Promise<void>;
+  moveFile: (fromPath: string, toPath: string) => Promise<void>;
+  deleteFile: (filePath: string) => Promise<void>;
+  mkdir: (dirPath: string) => Promise<void>;
+  ls: (dirPath: string) => Promise<string[]>;
+}
+
+// ─── Queue ───────────────────────────────────────────────────────────────────
+
+export interface QueueOptions {
+  /**
+   * Maximum number of simultaneous downloads when using the managed queue.
+   * Defaults to `3`.
+   */
+  maxConcurrent?: number;
+}
+
+export interface QueueStatus {
+  /** Number of downloads actively running right now */
+  active: number;
+  /** Number of downloads waiting in the queue */
+  pending: number;
+  /** Current `maxConcurrent` setting */
+  maxConcurrent: number;
+}
+
+interface QueueItem {
+  options: DownloadOptions;
+  resolve: (result: DownloadResult) => void;
+  reject: (reason?: any) => void;
+}
+
+class DownloadQueue {
+  private _maxConcurrent: number = 3;
+  private _active: number = 0;
+  private _queue: QueueItem[] = [];
+
+  setOptions(opts: QueueOptions): void {
+    if (opts.maxConcurrent != null && opts.maxConcurrent > 0) {
+      this._maxConcurrent = opts.maxConcurrent;
+      // Kick off any slots that just opened.
+      this._flush();
+    }
+  }
+
+  getStatus(): QueueStatus {
+    return {
+      active: this._active,
+      pending: this._queue.length,
+      maxConcurrent: this._maxConcurrent,
+    };
+  }
+
+  enqueue(options: DownloadOptions): Promise<DownloadResult> {
+    return new Promise<DownloadResult>((resolve, reject) => {
+      const item: QueueItem = { options, resolve, reject };
+      if (options.priority === 'high') {
+        this._queue.unshift(item);
+      } else {
+        this._queue.push(item);
+      }
+      this._flush();
+    });
+  }
+
+  private _flush(): void {
+    while (this._active < this._maxConcurrent && this._queue.length > 0) {
+      const item = this._queue.shift()!;
+      this._active++;
+      // Strip queue-specific fields before passing to the native layer.
+      const nativeOptions = { ...item.options };
+      delete nativeOptions.queue;
+      delete nativeOptions.priority;
+      _executeDownload(nativeOptions)
+        .then((result) => {
+          item.resolve(result);
+        })
+        .catch((err) => {
+          item.reject(err);
+        })
+        .finally(() => {
+          this._active--;
+          this._flush();
+        });
+    }
+  }
+}
+
+const _globalQueue = new DownloadQueue();
+
+/**
+ * Configure the global managed download queue.
+ *
+ * @example
+ * ```ts
+ * setQueueOptions({ maxConcurrent: 3 });
+ * ```
+ */
+export function setQueueOptions(options: QueueOptions): void {
+  _globalQueue.setOptions(options);
+}
+
+/**
+ * Get the current state of the managed download queue.
+ *
+ * @example
+ * ```ts
+ * const { active, pending, maxConcurrent } = getQueueStatus();
+ * ```
+ */
+export function getQueueStatus(): QueueStatus {
+  return _globalQueue.getStatus();
+}
+
 // ─── Core download ────────────────────────────────────────────────────────────
 
 /**
- * Download a file.
- *
- * For **foreground** downloads the promise resolves when the file is saved.
- * For **background** downloads the promise resolves immediately with a
- * `downloadId`; listen to the `onDownloadComplete` / `onDownloadError`
- * events for the final result.
+ * Core native download executor — used internally by `download()` and the queue.
+ * Never routes through the queue.
  */
-export async function download(
+async function _executeDownload(
   options: DownloadOptions
 ): Promise<DownloadResult> {
   let progressSubscription: ReturnType<typeof eventEmitter.addListener> | null =
@@ -289,7 +436,40 @@ export async function download(
   }
 }
 
-// ─── Core upload ──────────────────────────────────────────────────────────────
+/**
+ * Download a file.
+ *
+ * For **foreground** downloads the promise resolves when the file is saved.
+ * For **background** downloads the promise resolves immediately with a
+ * `downloadId`; listen to the `onDownloadComplete` / `onDownloadError`
+ * events for the final result.
+ *
+ * Pass `queue: true` to join the managed queue and respect the `maxConcurrent`
+ * limit configured via `setQueueOptions()`. Use `priority: 'high'` to jump
+ * ahead of other pending items in the queue.
+ *
+ * @example
+ * ```ts
+ * // Direct (unqueued) download
+ * const result = await download({ url: 'https://...' });
+ *
+ * // Queued download with high priority
+ * setQueueOptions({ maxConcurrent: 3 });
+ * const result = await download({
+ *   url: 'https://...',
+ *   queue: true,
+ *   priority: 'high',
+ * });
+ * ```
+ */
+export function download(options: DownloadOptions): Promise<DownloadResult> {
+  if (options.queue) {
+    return _globalQueue.enqueue(options);
+  }
+  return _executeDownload(options);
+}
+
+// ─── Core upload ───────────────────────────────────────────────────────────────
 
 /**
  * Upload a file using multipart/form-data.
@@ -435,6 +615,110 @@ export async function getBackgroundDownloads(): Promise<{
     return { success: false, error: error?.message || 'UNKNOWN_ERROR' };
   }
 }
+
+// ─── File system helpers ─────────────────────────────────────────────────────
+
+function _ensureFsSuccess(result: any, fallback: string): void {
+  if (!result?.success) {
+    throw new Error(result?.error || fallback);
+  }
+}
+
+/** Check whether a file or directory exists. */
+export async function exists(filePath: string): Promise<boolean> {
+  const result = await (DownloaderSpec as any).exists(filePath);
+  _ensureFsSuccess(result, 'EXISTS_ERROR');
+  return !!result.exists;
+}
+
+/** Get file or directory metadata. */
+export async function stat(filePath: string): Promise<FsStat> {
+  const result = await (DownloaderSpec as any).stat(filePath);
+  _ensureFsSuccess(result, 'STAT_ERROR');
+  return result.stat as FsStat;
+}
+
+/** Read a file as utf8 (default) or base64 string. */
+export async function readFile(
+  filePath: string,
+  encoding: FsEncoding = 'utf8'
+): Promise<string> {
+  const result = await (DownloaderSpec as any).readFile(filePath, encoding);
+  _ensureFsSuccess(result, 'READ_FILE_ERROR');
+  return result.data ?? '';
+}
+
+/** Write utf8 (default) or base64 data to a file. */
+export async function writeFile(
+  filePath: string,
+  data: string,
+  encoding: FsEncoding = 'utf8'
+): Promise<void> {
+  const result = await (DownloaderSpec as any).writeFile(
+    filePath,
+    data,
+    encoding
+  );
+  _ensureFsSuccess(result, 'WRITE_FILE_ERROR');
+}
+
+/** Copy a file from source to destination. */
+export async function copyFile(
+  fromPath: string,
+  toPath: string
+): Promise<void> {
+  const result = await (DownloaderSpec as any).copyFile(fromPath, toPath);
+  _ensureFsSuccess(result, 'COPY_FILE_ERROR');
+}
+
+/** Move a file from source to destination. */
+export async function moveFile(
+  fromPath: string,
+  toPath: string
+): Promise<void> {
+  const result = await (DownloaderSpec as any).moveFile(fromPath, toPath);
+  _ensureFsSuccess(result, 'MOVE_FILE_ERROR');
+}
+
+/** Create a directory recursively. */
+export async function mkdir(dirPath: string): Promise<void> {
+  const result = await (DownloaderSpec as any).mkdir(dirPath);
+  _ensureFsSuccess(result, 'MKDIR_ERROR');
+}
+
+/** List direct entries (names) in a directory. */
+export async function ls(dirPath: string): Promise<string[]> {
+  const result = await (DownloaderSpec as any).ls(dirPath);
+  _ensureFsSuccess(result, 'LS_ERROR');
+  return (result.entries || []) as string[];
+}
+
+/**
+ * File system API namespace.
+ *
+ * @example
+ * ```ts
+ * import { fs } from 'rn-downloader';
+ *
+ * const ok = await fs.exists('/path/to/file.pdf');
+ * const meta = await fs.stat('/path/to/file.pdf');
+ * const text = await fs.readFile('/path/to/file.txt');
+ * ```
+ */
+export const fs: FsApi = {
+  exists,
+  stat,
+  readFile,
+  writeFile,
+  copyFile,
+  moveFile,
+  deleteFile: async (filePath: string) => {
+    const result = await deleteFile(filePath);
+    _ensureFsSuccess(result, 'DELETE_FILE_ERROR');
+  },
+  mkdir,
+  ls,
+};
 
 // ─── Event helpers ────────────────────────────────────────────────────────────
 
@@ -670,4 +954,15 @@ export default {
   onDownloadError,
   onUploadProgress,
   onDownloadRetry,
+  setQueueOptions,
+  getQueueStatus,
+  exists,
+  stat,
+  readFile,
+  writeFile,
+  copyFile,
+  moveFile,
+  mkdir,
+  ls,
+  fs,
 };

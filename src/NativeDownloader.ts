@@ -10,6 +10,14 @@ export interface Spec extends TurboModule {
   deleteFile(filePath: string): Promise<Object>;
   clearCache(): Promise<Object>;
   getBackgroundDownloads(): Promise<Object>;
+  exists(filePath: string): Promise<Object>;
+  stat(filePath: string): Promise<Object>;
+  readFile(filePath: string, encoding: string): Promise<Object>;
+  writeFile(filePath: string, data: string, encoding: string): Promise<Object>;
+  copyFile(fromPath: string, toPath: string): Promise<Object>;
+  moveFile(fromPath: string, toPath: string): Promise<Object>;
+  mkdir(dirPath: string): Promise<Object>;
+  ls(dirPath: string): Promise<Object>;
   saveBase64AsFile(options: Object): Promise<Object>;
   urlToBase64(options: Object): Promise<Object>;
   shareFile(filePath: string, options: Object): Promise<Object>;
