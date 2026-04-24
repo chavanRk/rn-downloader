@@ -1,4 +1,4 @@
-# 🚀 rn-downloader
+# rn-downloader
 
 [![npm version](https://img.shields.io/npm/v/rn-downloader.svg?style=flat-square)](https://www.npmjs.com/package/rn-downloader)
 [![npm downloads](https://img.shields.io/npm/dm/rn-downloader.svg?style=flat-square)](https://www.npmjs.com/package/rn-downloader)
@@ -14,7 +14,7 @@ The easiest way to download files in React Native — with background support, p
 
 ⭐ **Star this repo if you found it useful** — it helps others discover the project!
 
-## 🤔 Problems?
+## Problems?
 
 Most React Native file download solutions have one or more of these problems:
 
@@ -47,7 +47,7 @@ Most React Native file download solutions have one or more of these problems:
 
 ---
 
-## 💻 Installation
+## Installation
 
 ```sh
 npm install rn-downloader
@@ -55,7 +55,7 @@ npm install rn-downloader
 
 ---
 
-## 📖 API
+## API
 
 ### `download(options)`
 
@@ -233,7 +233,7 @@ await clearCache();
 
 ---
 
-## 🎯 Use Cases
+## Use Cases
 
 ### Download from URLs
 
@@ -259,7 +259,7 @@ Convert base64-encoded data (like images from canvas, camera, or API responses) 
 
 ---
 
-## 📐 Type Reference
+## Type Reference
 
 | Type                 | Fields                                                                                                                    |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------- |
@@ -280,13 +280,13 @@ Convert base64-encoded data (like images from canvas, camera, or API responses) 
 
 ---
 
-## ✏️ Articles & Resources
+## Articles & Resources
 
 - [**Why Downloading Files in React Native is Still Broken in 2026 (and How to Fix It)**](https://medium.com/@chavanrohit413/why-downloading-files-in-react-native-is-still-broken-in-2026-and-how-to-fix-it-16ca47a6bd8b) — Deep dive into the problems with existing solutions and how rn-downloader solves them
 
 ---
 
-## 🔗 Links
+## Links
 
 - [GitHub](https://github.com/chavan-labs/rn-downloader)
 - [npm](https://www.npmjs.com/package/rn-downloader)
