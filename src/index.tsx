@@ -1,3 +1,4 @@
+import { useState, useCallback, useRef } from 'react';
 import { NativeEventEmitter, NativeModules } from 'react-native';
 import DownloaderSpec from './NativeDownloader';
 
@@ -5,6 +6,23 @@ const DownloaderModule = NativeModules.Downloader || DownloaderSpec;
 const eventEmitter = new NativeEventEmitter(DownloaderModule);
 
 // ─── Types ────────────────────────────────────────────────────────────────────
+
+/**
+ * Rich progress information emitted during a download.
+ * Replaces the plain `number` percent from earlier versions.
+ */
+export interface ProgressInfo {
+  /** Download progress as a percentage (0–100) */
+  percent: number;
+  /** Number of bytes downloaded so far */
+  bytesDownloaded: number;
+  /** Total file size in bytes (0 if unknown) */
+  totalBytes: number;
+  /** Current download speed in bytes per second */
+  speedBps: number;
+  /** Estimated seconds remaining (0 if unknown) */
+  etaSeconds: number;
+}
 
 export interface DownloadOptions {
   /** Remote URL to download from */
@@ -37,8 +55,8 @@ export interface DownloadOptions {
     hash: string;
     algorithm: 'md5' | 'sha1' | 'sha256';
   };
-  /** Called with progress 0–100 during foreground downloads */
-  onProgress?: (percent: number) => void;
+  /** Called with rich progress info during foreground downloads */
+  onProgress?: (info: ProgressInfo) => void;
   /**
    * Join the managed download queue instead of starting immediately.
    * Respects the `maxConcurrent` limit set via `setQueueOptions()`.
@@ -365,6 +383,12 @@ async function _executeDownload(
   // fall back to URL-based filtering in that case.
   let knownDownloadId: string | null = null;
 
+  // Speed / ETA tracking (JS-side, works regardless of native platform)
+  let _lastProgressTs: number | null = null;
+  let _lastProgressBytes: number = 0;
+  // Smoothed speed using exponential moving average (α = 0.3)
+  let _smoothedSpeedBps: number = 0;
+
   if (options.onProgress) {
     progressSubscription = eventEmitter.addListener(
       'onDownloadProgress',
@@ -373,7 +397,66 @@ async function _executeDownload(
           knownDownloadId && event.downloadId === knownDownloadId;
         const matchesUrl = !knownDownloadId && event.url === options.url;
         if ((matchesId || matchesUrl) && options.onProgress) {
-          options.onProgress(event.progress);
+          const now = Date.now();
+          const percent: number = event.progress ?? 0;
+          const bytesDownloaded: number = event.bytesDownloaded ?? 0;
+          const totalBytes: number = event.totalBytes ?? 0;
+
+          let speedBps = 0;
+          let etaSeconds = 0;
+
+          if (_lastProgressTs !== null) {
+            const dtSec = (now - _lastProgressTs) / 1000;
+            if (dtSec > 0) {
+              const bytesDelta = bytesDownloaded - _lastProgressBytes;
+              // Only update speed if we have byte-level data from native
+              if (bytesDelta > 0 && totalBytes > 0) {
+                const instantSpeed = bytesDelta / dtSec;
+                // Exponential moving average for smoother readings
+                _smoothedSpeedBps =
+                  _smoothedSpeedBps === 0
+                    ? instantSpeed
+                    : 0.3 * instantSpeed + 0.7 * _smoothedSpeedBps;
+                speedBps = _smoothedSpeedBps;
+                const remaining = totalBytes - bytesDownloaded;
+                etaSeconds = speedBps > 0 ? remaining / speedBps : 0;
+              } else if (percent > 0 && percent < 100) {
+                // Fallback: estimate from percent when bytes aren't available
+                const estimatedTotalBytes =
+                  totalBytes > 0
+                    ? totalBytes
+                    : _lastProgressBytes / (percent / 100);
+                const percentDelta =
+                  percent - (_lastProgressBytes / estimatedTotalBytes) * 100;
+                if (percentDelta > 0) {
+                  const estimatedByteDelta =
+                    (percentDelta / 100) * estimatedTotalBytes;
+                  const instantSpeed = estimatedByteDelta / dtSec;
+                  _smoothedSpeedBps =
+                    _smoothedSpeedBps === 0
+                      ? instantSpeed
+                      : 0.3 * instantSpeed + 0.7 * _smoothedSpeedBps;
+                  speedBps = _smoothedSpeedBps;
+                  const remainingPct = 100 - percent;
+                  const estimatedRemaining =
+                    (remainingPct / 100) * estimatedTotalBytes;
+                  etaSeconds = speedBps > 0 ? estimatedRemaining / speedBps : 0;
+                }
+              }
+            }
+          }
+
+          _lastProgressTs = now;
+          _lastProgressBytes = bytesDownloaded;
+
+          const info: ProgressInfo = {
+            percent,
+            bytesDownloaded,
+            totalBytes,
+            speedBps,
+            etaSeconds,
+          };
+          options.onProgress(info);
         }
       }
     );
@@ -936,6 +1019,236 @@ export async function openFile(
   }
 }
 
+// ─── Zip / Unzip ─────────────────────────────────────────────────────────────
+
+export interface UnzipResult {
+  success: boolean;
+  /** Absolute path of the destination directory */
+  destDir?: string;
+  /** List of absolute paths of all extracted files */
+  files?: string[];
+  /** Error message if success is false */
+  error?: string;
+}
+
+export interface ZipResult {
+  success: boolean;
+  /** Absolute path of the created zip archive */
+  zipPath?: string;
+  /** Error message if success is false */
+  error?: string;
+}
+
+/**
+ * Extract a ZIP archive to a destination directory.
+ *
+ * Uses `java.util.zip` on Android and zlib (system framework) on iOS.
+ * No third-party dependency required.
+ *
+ * @param sourcePath Absolute path to the `.zip` file
+ * @param destDir    Absolute path to the directory where files will be extracted.
+ *                   The directory is created automatically if it does not exist.
+ *
+ * @example
+ * ```ts
+ * const result = await unzip(
+ *   '/path/to/archive.zip',
+ *   '/path/to/output-folder'
+ * );
+ *
+ * if (result.success) {
+ *   console.log('Extracted files:', result.files);
+ * }
+ * ```
+ */
+export async function unzip(
+  sourcePath: string,
+  destDir: string
+): Promise<UnzipResult> {
+  try {
+    const result = await (DownloaderSpec as any).unzip(sourcePath, destDir);
+    return result as UnzipResult;
+  } catch (error: any) {
+    return { success: false, error: error?.message || 'UNZIP_ERROR' };
+  }
+}
+
+/**
+ * Create a ZIP archive from a file or directory.
+ *
+ * Uses `java.util.zip` on Android and zlib (system framework) on iOS.
+ * No third-party dependency required.
+ *
+ * @param sourcePath Absolute path to the file or directory to compress
+ * @param destPath   Absolute path for the output `.zip` file.
+ *                   Parent directory is created automatically if needed.
+ *
+ * @example
+ * ```ts
+ * // Zip a single file
+ * const result = await zip(
+ *   '/path/to/document.pdf',
+ *   '/path/to/document.zip'
+ * );
+ *
+ * // Zip an entire directory
+ * const result = await zip(
+ *   '/path/to/my-folder',
+ *   '/path/to/my-folder.zip'
+ * );
+ *
+ * if (result.success) {
+ *   console.log('Archive created at:', result.zipPath);
+ * }
+ * ```
+ */
+export async function zip(
+  sourcePath: string,
+  destPath: string
+): Promise<ZipResult> {
+  try {
+    const result = await (DownloaderSpec as any).zip(sourcePath, destPath);
+    return result as ZipResult;
+  } catch (error: any) {
+    return { success: false, error: error?.message || 'ZIP_ERROR' };
+  }
+}
+
+// ─── useDownload hook ─────────────────────────────────────────────────────────
+
+export type DownloadStatus =
+  | 'idle'
+  | 'downloading'
+  | 'paused'
+  | 'done'
+  | 'error';
+
+export interface UseDownloadReturn {
+  /** Start a download. Resolves with the final result. */
+  start: (options: DownloadOptions) => Promise<DownloadResult>;
+  /** Pause the current download */
+  pause: () => Promise<void>;
+  /** Resume the current download */
+  resume: () => Promise<void>;
+  /** Cancel the current download */
+  cancel: () => Promise<void>;
+  /** Current status of the download */
+  status: DownloadStatus;
+  /** Rich progress information (null until first progress event) */
+  progress: ProgressInfo | null;
+  /** Final result once download completes or fails */
+  result: DownloadResult | null;
+  /** The active download ID (available after download starts) */
+  downloadId: string | null;
+}
+
+/**
+ * React hook for managing a single download with built-in state.
+ *
+ * Tracks status, rich progress (percent, speed, ETA), and the final result.
+ * Exposes `pause`, `resume`, and `cancel` controls tied to the active download.
+ *
+ * @example
+ * ```tsx
+ * function DownloadButton() {
+ *   const { start, pause, resume, cancel, status, progress, result } = useDownload();
+ *
+ *   return (
+ *     <View>
+ *       <Button
+ *         title="Download"
+ *         onPress={() => start({ url: 'https://example.com/file.zip' })}
+ *       />
+ *
+ *       {status === 'downloading' && progress && (
+ *         <View>
+ *           <Text>{progress.percent.toFixed(1)}%</Text>
+ *           <Text>Speed: {(progress.speedBps / 1024).toFixed(1)} KB/s</Text>
+ *           <Text>ETA: {progress.etaSeconds.toFixed(0)}s</Text>
+ *           <ProgressBar value={progress.percent / 100} />
+ *           <Button title="Pause" onPress={pause} />
+ *         </View>
+ *       )}
+ *
+ *       {status === 'paused' && (
+ *         <Button title="Resume" onPress={resume} />
+ *       )}
+ *
+ *       {status === 'done' && result?.success && (
+ *         <Text>Saved to: {result.filePath}</Text>
+ *       )}
+ *
+ *       {status === 'error' && (
+ *         <Text>Error: {result?.error}</Text>
+ *       )}
+ *     </View>
+ *   );
+ * }
+ * ```
+ */
+export function useDownload(): UseDownloadReturn {
+  const [status, setStatus] = useState<DownloadStatus>('idle');
+  const [progress, setProgress] = useState<ProgressInfo | null>(null);
+  const [result, setResult] = useState<DownloadResult | null>(null);
+  const [downloadId, setDownloadId] = useState<string | null>(null);
+  const downloadIdRef = useRef<string | null>(null);
+
+  const start = useCallback(
+    async (options: DownloadOptions): Promise<DownloadResult> => {
+      setStatus('downloading');
+      setProgress(null);
+      setResult(null);
+      setDownloadId(null);
+      downloadIdRef.current = null;
+
+      const res = await download({
+        ...options,
+        onProgress: (info: ProgressInfo) => {
+          setProgress(info);
+          options.onProgress?.(info);
+        },
+      });
+
+      if (res.downloadId) {
+        downloadIdRef.current = res.downloadId;
+        setDownloadId(res.downloadId);
+      }
+
+      setResult(res);
+      setStatus(res.success ? 'done' : 'error');
+      return res;
+    },
+    []
+  );
+
+  const pause = useCallback(async (): Promise<void> => {
+    if (downloadIdRef.current) {
+      await pauseDownload(downloadIdRef.current);
+      setStatus('paused');
+    }
+  }, []);
+
+  const resume = useCallback(async (): Promise<void> => {
+    if (downloadIdRef.current) {
+      await resumeDownload(downloadIdRef.current);
+      setStatus('downloading');
+    }
+  }, []);
+
+  const cancel = useCallback(async (): Promise<void> => {
+    if (downloadIdRef.current) {
+      await cancelDownload(downloadIdRef.current);
+      setStatus('idle');
+      setProgress(null);
+      setResult(null);
+      downloadIdRef.current = null;
+      setDownloadId(null);
+    }
+  }, []);
+
+  return { start, pause, resume, cancel, status, progress, result, downloadId };
+}
+
 export default {
   download,
   upload,
@@ -965,4 +1278,7 @@ export default {
   mkdir,
   ls,
   fs,
+  useDownload,
+  unzip,
+  zip,
 };

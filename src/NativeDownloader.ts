@@ -22,6 +22,8 @@ export interface Spec extends TurboModule {
   urlToBase64(options: Object): Promise<Object>;
   shareFile(filePath: string, options: Object): Promise<Object>;
   openFile(filePath: string, mimeType: string): Promise<Object>;
+  unzip(sourcePath: string, destDir: string): Promise<Object>;
+  zip(sourcePath: string, destPath: string): Promise<Object>;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('Downloader');

@@ -10,7 +10,7 @@ The easiest way to download **and manage files** in React Native — with backgr
 
 > 100% pure native code (Kotlin + Swift). Zero third-party dependencies.
 
-**Keywords:** react native download, react native file download, react native background download, react native download manager, react native file upload, react native download progress, react native pause resume download, react native cache manager, react native turbo module, expo download, iOS URLSession, Android DownloadManager, react native checksum validation, base64 converter, url to base64, data uri, share file, open file, file sharing, native share, document viewer, download queue, concurrent downloads, queue concurrency, priority queue, batch download, max concurrent downloads, react native filesystem, read file, write file, copy file, move file, stat file, file exists
+**Keywords:** react native download, react native file download, react native background download, react native download manager, react native file upload, react native download progress, react native pause resume download, react native cache manager, react native turbo module, expo download, iOS URLSession, Android DownloadManager, react native checksum validation, base64 converter, url to base64, data uri, share file, open file, file sharing, native share, document viewer, download queue, concurrent downloads, queue concurrency, priority queue, batch download, max concurrent downloads, react native filesystem, read file, write file, copy file, move file, stat file, file exists, useDownload hook, download speed, download eta, download progress bytes
 
 ⭐ **Star this repo if you found it useful** — it helps others discover the project!
 
@@ -29,6 +29,9 @@ Most React Native file download solutions have one or more of these problems:
 
 ## ✨ Features
 
+- **`useDownload()` hook** — drop-in React hook with built-in state: `status`, `progress`, `result`, `pause`, `resume`, `cancel` — no competitors have this
+- **Rich progress info** — `onProgress` gives you `percent`, `bytesDownloaded`, `totalBytes`, `speedBps`, and `etaSeconds` — not just a plain number
+- **Zip & Unzip** — compress files/directories and extract ZIP archives natively with **zero third-party dependencies** (`java.util.zip` on Android, system `zlib` on iOS)
 - **Download with progress** — clean `0 → 100` progress natively, no UI freezing
 - **Background downloads** — survive app suspension (iOS background URLSession + Android DownloadManager)
 - **Download Queue** — built-in concurrency-limited queue with `maxConcurrent` control and `high`/`normal` priority
@@ -75,7 +78,19 @@ const result = await download({
     hash: 'd41d8cd98f00b204e9800998ecf8427e',
     algorithm: 'md5',
   },
-  onProgress: (p) => console.log(`${p}%`),
+  onProgress: ({
+    percent,
+    bytesDownloaded,
+    totalBytes,
+    speedBps,
+    etaSeconds,
+  }) => {
+    console.log(
+      `${percent.toFixed(1)}% — ${(speedBps / 1024).toFixed(
+        1
+      )} KB/s — ETA ${etaSeconds.toFixed(0)}s`
+    );
+  },
   // Auto-retry on network failure (optional)
   retry: {
     attempts: 3, // max retry attempts
@@ -137,6 +152,69 @@ console.log(`Running: ${active}  Waiting: ${pending}  Limit: ${maxConcurrent}`);
 > - `priority: 'normal'` (default) — item is appended to the **back**.
 > - `setQueueOptions` can be called at any time; if `maxConcurrent` is increased, idle slots are filled immediately.
 > - All other `DownloadOptions` (`onProgress`, `retry`, `checksum`, `headers`, etc.) work exactly the same inside the queue.
+
+---
+
+### `useDownload()` hook
+
+The easiest way to manage a download inside a React component. Get status, rich progress (with speed & ETA), and full controls — all with zero boilerplate.
+
+```tsx
+import { useDownload } from 'rn-downloader';
+
+function DownloadScreen() {
+  const { start, pause, resume, cancel, status, progress, result } =
+    useDownload();
+
+  return (
+    <View>
+      <Button
+        title="Download"
+        onPress={() =>
+          start({
+            url: 'https://example.com/video.mp4',
+            destination: 'documents',
+          })
+        }
+      />
+
+      {status === 'downloading' && progress && (
+        <View>
+          <Text>{progress.percent.toFixed(1)}%</Text>
+          <Text>Speed: {(progress.speedBps / 1024).toFixed(1)} KB/s</Text>
+          <Text>ETA: {progress.etaSeconds.toFixed(0)}s</Text>
+          <Text>
+            {(progress.bytesDownloaded / 1024 / 1024).toFixed(1)} MB
+            {' / '}
+            {(progress.totalBytes / 1024 / 1024).toFixed(1)} MB
+          </Text>
+          <Button title="Pause" onPress={pause} />
+          <Button title="Cancel" onPress={cancel} />
+        </View>
+      )}
+
+      {status === 'paused' && <Button title="Resume" onPress={resume} />}
+
+      {status === 'done' && result?.success && (
+        <Text>✅ Saved to: {result.filePath}</Text>
+      )}
+
+      {status === 'error' && <Text>❌ {result?.error}</Text>}
+    </View>
+  );
+}
+```
+
+| Property         | Type                                                       | Description                     |
+| ---------------- | ---------------------------------------------------------- | ------------------------------- |
+| `start(options)` | `(options: DownloadOptions) => Promise<DownloadResult>`    | Start a download                |
+| `pause()`        | `() => Promise<void>`                                      | Pause the active download       |
+| `resume()`       | `() => Promise<void>`                                      | Resume a paused download        |
+| `cancel()`       | `() => Promise<void>`                                      | Cancel and discard the download |
+| `status`         | `'idle' \| 'downloading' \| 'paused' \| 'done' \| 'error'` | Current state                   |
+| `progress`       | `ProgressInfo \| null`                                     | Live progress info (see below)  |
+| `result`         | `DownloadResult \| null`                                   | Final result once complete      |
+| `downloadId`     | `string \| null`                                           | Active download ID              |
 
 ---
 
@@ -254,6 +332,64 @@ if (result.success) {
 
 ---
 
+### `unzip(sourcePath, destDir)` · `zip(sourcePath, destPath)`
+
+Compress and extract ZIP archives natively — **no third-party library required**.
+
+- **Android** uses `java.util.zip` (built into the Android SDK, every API level).
+- **iOS** uses `zlib` (system framework, linked via `s.libraries = 'z'` in the podspec — ships on every iPhone/iPad).
+
+```javascript
+import { download, unzip, zip } from 'rn-downloader';
+
+// ── Unzip a downloaded archive ──────────────────────────────────────────────
+const dl = await download({
+  url: 'https://example.com/assets.zip',
+  destination: 'cache',
+});
+
+if (dl.success) {
+  const result = await unzip(
+    dl.filePath, // absolute path to the .zip file
+    '/path/to/output-folder' // destination directory (created if it doesn't exist)
+  );
+
+  if (result.success) {
+    console.log('Destination:', result.destDir);
+    console.log('Extracted files:', result.files);
+    // result.files → ['/path/to/output-folder/image.png', ...]
+  } else {
+    console.log('Error:', result.error);
+  }
+}
+
+// ── Zip a single file ───────────────────────────────────────────────────────
+const zipResult = await zip(
+  '/path/to/document.pdf', // source file
+  '/path/to/document.zip' // output archive path
+);
+
+if (zipResult.success) {
+  console.log('Archive created at:', zipResult.zipPath);
+}
+
+// ── Zip an entire directory ─────────────────────────────────────────────────
+const dirResult = await zip(
+  '/path/to/my-folder', // source directory
+  '/path/to/my-folder.zip' // output archive path
+);
+```
+
+> **Notes:**
+>
+> - `unzip` auto-creates the destination directory including any intermediate folders.
+> - `unzip` on Android protects against [zip-slip attacks](https://snyk.io/research/zip-slip-vulnerability) by validating each entry path.
+> - `zip` supports both single files and entire directory trees (recursive).
+> - Both functions run on a background thread and never block the JS thread.
+> - Supported compression methods: **Deflate** (method 8) and **Store** (method 0) — the two methods used by virtually every ZIP file.
+
+---
+
 ### Pause / Resume / Cancel
 
 ```javascript
@@ -344,9 +480,12 @@ Convert base64-encoded data (like images from canvas, camera, or API responses) 
 | Type                 | Fields                                                                                                                                           |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `DownloadOptions`    | `url`, `fileName?`, `background?`, `headers?`, `destination?`, `notificationTitle?`, `checksum?`, `onProgress?`, `retry?`, `queue?`, `priority?` |
+| `ProgressInfo`       | `percent`, `bytesDownloaded`, `totalBytes`, `speedBps`, `etaSeconds`                                                                             |
 | `RetryOptions`       | `attempts`, `delay?`, `onRetry?`                                                                                                                 |
 | `QueueOptions`       | `maxConcurrent?`                                                                                                                                 |
 | `QueueStatus`        | `active`, `pending`, `maxConcurrent`                                                                                                             |
+| `DownloadStatus`     | `'idle' \| 'downloading' \| 'paused' \| 'done' \| 'error'`                                                                                       |
+| `UseDownloadReturn`  | `start`, `pause`, `resume`, `cancel`, `status`, `progress`, `result`, `downloadId`                                                               |
 | `FsEncoding`         | `'utf8' \| 'base64'`                                                                                                                             |
 | `FsStat`             | `path`, `name`, `size`, `modified`, `isDir`                                                                                                      |
 | `FsApi`              | `exists`, `stat`, `readFile`, `writeFile`, `copyFile`, `moveFile`, `deleteFile`, `mkdir`, `ls`                                                   |
@@ -357,6 +496,8 @@ Convert base64-encoded data (like images from canvas, camera, or API responses) 
 | `OpenFileOptions`    | `filePath`, `mimeType?`                                                                                                                          |
 | `DownloadResult`     | `success`, `filePath?`, `downloadId?`, `error?`                                                                                                  |
 | `UploadResult`       | `success`, `status?`, `data?`, `error?`                                                                                                          |
+| `UnzipResult`        | `success`, `destDir?`, `files?`, `error?`                                                                                                        |
+| `ZipResult`          | `success`, `zipPath?`, `error?`                                                                                                                  |
 | `SaveBase64Result`   | `success`, `filePath?`, `error?`                                                                                                                 |
 | `UrlToBase64Result`  | `success`, `base64?`, `mimeType?`, `dataUri?`, `error?`                                                                                          |
 | `ShareFileResult`    | `success`, `completed?`, `error?`                                                                                                                |

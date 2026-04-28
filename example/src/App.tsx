@@ -8,7 +8,12 @@ import {
   Alert,
   ScrollView,
 } from 'react-native';
-import { download, shareFile, openFile } from 'rn-downloader';
+import {
+  download,
+  shareFile,
+  openFile,
+  type ProgressInfo,
+} from 'rn-downloader';
 
 export default function App() {
   const [progress, setProgress] = useState<number>(0);
@@ -32,7 +37,7 @@ export default function App() {
 
     const res = await download({
       url: SAMPLE_URL,
-      onProgress: (p) => setProgress(p),
+      onProgress: (info: ProgressInfo) => setProgress(info.percent),
     });
 
     setDownloading(false);
@@ -69,7 +74,7 @@ export default function App() {
           ]);
         },
       },
-      onProgress: (p) => setRetryProgress(p),
+      onProgress: (info: ProgressInfo) => setRetryProgress(info.percent),
     });
 
     setRetryDownloading(false);

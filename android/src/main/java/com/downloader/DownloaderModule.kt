@@ -20,6 +20,9 @@ import java.net.URL
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 import kotlin.concurrent.thread
 import android.webkit.MimeTypeMap
 
@@ -1065,6 +1068,131 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
     } else {
       "application/octet-stream"
     }
+  }
+
+  // ─── Unzip ─────────────────────────────────────────────────────────────────
+
+  override fun unzip(sourcePath: String, destDir: String, promise: Promise) {
+    thread {
+      try {
+        val sourceFile = File(sourcePath)
+        if (!sourceFile.exists()) {
+          promise.resolve(Arguments.createMap().apply {
+            putBoolean("success", false)
+            putString("error", "Source zip file does not exist: $sourcePath")
+          })
+          return@thread
+        }
+
+        val destDirFile = File(destDir)
+        destDirFile.mkdirs()
+
+        val extractedFiles = Arguments.createArray()
+
+        ZipInputStream(FileInputStream(sourceFile).buffered()).use { zis ->
+          var entry: ZipEntry? = zis.nextEntry
+          while (entry != null) {
+            // Prevent zip-slip attacks
+            val entryFile = File(destDirFile, entry.name)
+            val canonicalDest = destDirFile.canonicalPath
+            val canonicalEntry = entryFile.canonicalPath
+            if (!canonicalEntry.startsWith(canonicalDest + File.separator) &&
+                canonicalEntry != canonicalDest) {
+              entry = zis.nextEntry
+              continue
+            }
+
+            if (entry.isDirectory) {
+              entryFile.mkdirs()
+            } else {
+              entryFile.parentFile?.mkdirs()
+              FileOutputStream(entryFile).buffered().use { fos ->
+                zis.copyTo(fos)
+              }
+              extractedFiles.pushString(entryFile.absolutePath)
+            }
+            zis.closeEntry()
+            entry = zis.nextEntry
+          }
+        }
+
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", true)
+          putString("destDir", destDirFile.absolutePath)
+          putArray("files", extractedFiles)
+        })
+      } catch (e: Exception) {
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("error", e.message ?: "UNZIP_ERROR")
+        })
+      }
+    }
+  }
+
+  // ─── Zip ───────────────────────────────────────────────────────────────────
+
+  override fun zip(sourcePath: String, destPath: String, promise: Promise) {
+    thread {
+      try {
+        val sourceFile = File(sourcePath)
+        if (!sourceFile.exists()) {
+          promise.resolve(Arguments.createMap().apply {
+            putBoolean("success", false)
+            putString("error", "Source path does not exist: $sourcePath")
+          })
+          return@thread
+        }
+
+        val destFile = File(destPath)
+        destFile.parentFile?.mkdirs()
+        destFile.delete()
+
+        ZipOutputStream(FileOutputStream(destFile).buffered()).use { zos ->
+          if (sourceFile.isDirectory) {
+            zipDirectory(sourceFile, sourceFile.name, zos)
+          } else {
+            zipFile(sourceFile, sourceFile.name, zos)
+          }
+        }
+
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", true)
+          putString("zipPath", destFile.absolutePath)
+        })
+      } catch (e: Exception) {
+        promise.resolve(Arguments.createMap().apply {
+          putBoolean("success", false)
+          putString("error", e.message ?: "ZIP_ERROR")
+        })
+      }
+    }
+  }
+
+  private fun zipDirectory(dir: File, baseName: String, zos: ZipOutputStream) {
+    val files = dir.listFiles() ?: return
+    if (files.isEmpty()) {
+      // Add empty directory entry
+      zos.putNextEntry(ZipEntry("$baseName/"))
+      zos.closeEntry()
+      return
+    }
+    for (file in files) {
+      val entryName = "$baseName/${file.name}"
+      if (file.isDirectory) {
+        zipDirectory(file, entryName, zos)
+      } else {
+        zipFile(file, entryName, zos)
+      }
+    }
+  }
+
+  private fun zipFile(file: File, entryName: String, zos: ZipOutputStream) {
+    zos.putNextEntry(ZipEntry(entryName))
+    FileInputStream(file).buffered().use { fis ->
+      fis.copyTo(zos)
+    }
+    zos.closeEntry()
   }
 
   companion object {

@@ -3,6 +3,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <UIKit/UIKit.h>
 #import "Downloader.h"
+#include <zlib.h>
 
 // ─── Foreground session delegate ──────────────────────────────────────────────
 @interface Downloader () <NSURLSessionDownloadDelegate, NSURLSessionDataDelegate, UIDocumentInteractionControllerDelegate>
@@ -1074,6 +1075,374 @@ RCT_REMAP_METHOD(openFile,
         rootViewController = rootViewController.presentedViewController;
     }
     return rootViewController;
+}
+
+// ─── Unzip ────────────────────────────────────────────────────────────────────
+
+RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
+                  destDir:(NSString *)destDir
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
+{
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSURL *sourceURL = [NSURL fileURLWithPath:sourcePath];
+        NSURL *destURL   = [NSURL fileURLWithPath:destDir];
+
+        // Ensure destination directory exists
+        NSError *mkdirErr = nil;
+        [fm createDirectoryAtURL:destURL withIntermediateDirectories:YES attributes:nil error:&mkdirErr];
+
+        // Use NSData + manual zip parsing via Foundation's built-in zip support
+        // (available via -[NSFileManager createDirectoryAtPath] + zlib read loop)
+        // We use the C-level zlib (linked via s.libraries = 'z') through minizip-style reading.
+        // Simpler approach: use the Objective-C Archive API available on all iOS versions.
+
+        // Primary path: try SSZipArchive-style pure-C zlib approach
+        // Since we only have zlib (no minizip headers), we'll use NSData + the public
+        // Archive Utility API: ziparchive is not available, but we CAN use:
+        //   -[NSFileWrapper] or the Archive framework (iOS 16+).
+        // Most reliable zero-dependency path: pipe through /usr/bin/unzip subprocess.
+        // On iOS that binary doesn't exist. So we use the ZipFoundation-compatible
+        // pure-Foundation approach using NSInputStream with a known zip local-file header parser.
+
+        // ── Pure-Foundation zip reader (no third-party, no subprocess) ──────────
+        NSData *zipData = [NSData dataWithContentsOfFile:sourcePath];
+        if (!zipData) {
+            resolve(@{@"success": @NO, @"error": @"Cannot read zip file"});
+            return;
+        }
+
+        NSMutableArray<NSString *> *extractedFiles = [NSMutableArray new];
+        NSError *extractError = nil;
+        BOOL ok = [self extractZipData:zipData toDirectory:destDir extractedFiles:extractedFiles error:&extractError];
+
+        if (ok) {
+            resolve(@{@"success": @YES, @"destDir": destDir, @"files": extractedFiles});
+        } else {
+            resolve(@{@"success": @NO, @"error": extractError.localizedDescription ?: @"UNZIP_ERROR"});
+        }
+    });
+}
+
+/**
+ * Pure-Foundation ZIP extractor.
+ * Parses the ZIP local file headers (signature 0x04034b50) sequentially.
+ * Uses zlib inflate (deflate method) and store (method 0) — the two methods
+ * used by virtually every ZIP file in the wild.
+ * No third-party library required; zlib is a system framework (s.libraries = 'z').
+ */
+- (BOOL)extractZipData:(NSData *)data
+           toDirectory:(NSString *)destDir
+        extractedFiles:(NSMutableArray<NSString *> *)extractedFiles
+                 error:(NSError **)error
+{
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
+    NSUInteger length    = data.length;
+    NSUInteger offset    = 0;
+    NSFileManager *fm    = [NSFileManager defaultManager];
+
+    while (offset + 30 <= length) {
+        // Local file header signature
+        uint32_t sig = 0;
+        memcpy(&sig, bytes + offset, 4);
+        if (sig != 0x04034b50) break; // no more local headers
+
+        uint16_t method        = 0; memcpy(&method,        bytes + offset + 8,  2);
+        uint32_t crc32val      = 0; memcpy(&crc32val,      bytes + offset + 14, 4);
+        uint32_t compSize      = 0; memcpy(&compSize,      bytes + offset + 18, 4);
+        uint32_t uncompSize    = 0; memcpy(&uncompSize,    bytes + offset + 22, 4);
+        uint16_t fileNameLen   = 0; memcpy(&fileNameLen,   bytes + offset + 26, 2);
+        uint16_t extraFieldLen = 0; memcpy(&extraFieldLen, bytes + offset + 28, 2);
+
+        // Little-endian on all platforms
+        method        = CFSwapInt16LittleToHost(method);
+        compSize      = CFSwapInt32LittleToHost(compSize);
+        uncompSize    = CFSwapInt32LittleToHost(uncompSize);
+        fileNameLen   = CFSwapInt16LittleToHost(fileNameLen);
+        extraFieldLen = CFSwapInt16LittleToHost(extraFieldLen);
+
+        offset += 30;
+        if (offset + fileNameLen > length) break;
+
+        NSString *fileName = [[NSString alloc] initWithBytes:bytes + offset
+                                                       length:fileNameLen
+                                                     encoding:NSUTF8StringEncoding];
+        if (!fileName) fileName = [[NSString alloc] initWithBytes:bytes + offset
+                                                            length:fileNameLen
+                                                          encoding:NSISOLatin1StringEncoding];
+        offset += fileNameLen + extraFieldLen;
+
+        if (!fileName || offset + compSize > length) {
+            offset += compSize;
+            continue;
+        }
+
+        NSString *destPath = [destDir stringByAppendingPathComponent:fileName];
+
+        // Directory entry
+        if ([fileName hasSuffix:@"/"]) {
+            [fm createDirectoryAtPath:destPath withIntermediateDirectories:YES attributes:nil error:nil];
+            continue;
+        }
+
+        // Ensure parent directory
+        NSString *parentDir = [destPath stringByDeletingLastPathComponent];
+        [fm createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+        const uint8_t *compData = bytes + offset;
+
+        if (method == 0) {
+            // Store (no compression)
+            NSData *fileData = [NSData dataWithBytes:compData length:compSize];
+            if (![fileData writeToFile:destPath options:NSDataWritingAtomic error:error]) {
+                return NO;
+            }
+        } else if (method == 8) {
+            // Deflate — use zlib inflate with raw deflate stream
+            NSMutableData *output = [NSMutableData dataWithLength:uncompSize > 0 ? uncompSize : 65536];
+            z_stream strm;
+            memset(&strm, 0, sizeof(strm));
+            strm.next_in  = (Bytef *)compData;
+            strm.avail_in = (uInt)compSize;
+
+            // inflateInit2 with -15 for raw deflate (no zlib wrapper)
+            if (inflateInit2(&strm, -15) != Z_OK) {
+                if (error) *error = [NSError errorWithDomain:@"RNDownloader" code:-1
+                    userInfo:@{NSLocalizedDescriptionKey: @"zlib inflateInit2 failed"}];
+                return NO;
+            }
+
+            if (uncompSize > 0) {
+                [output setLength:uncompSize];
+                strm.next_out  = (Bytef *)output.mutableBytes;
+                strm.avail_out = (uInt)uncompSize;
+                int ret = inflate(&strm, Z_FINISH);
+                inflateEnd(&strm);
+                if (ret != Z_STREAM_END && ret != Z_OK) {
+                    if (error) *error = [NSError errorWithDomain:@"RNDownloader" code:-2
+                        userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"inflate error %d", ret]}];
+                    return NO;
+                }
+                [output setLength:strm.total_out];
+            } else {
+                // Unknown uncompressed size: inflate in chunks
+                NSMutableData *chunk = [NSMutableData dataWithLength:65536];
+                NSMutableData *result = [NSMutableData new];
+                int ret;
+                do {
+                    strm.next_out  = (Bytef *)chunk.mutableBytes;
+                    strm.avail_out = (uInt)chunk.length;
+                    ret = inflate(&strm, Z_NO_FLUSH);
+                    if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) break;
+                    NSUInteger produced = chunk.length - strm.avail_out;
+                    [result appendBytes:chunk.mutableBytes length:produced];
+                } while (ret != Z_STREAM_END);
+                inflateEnd(&strm);
+                output = result;
+            }
+
+            if (![output writeToFile:destPath options:NSDataWritingAtomic error:error]) {
+                return NO;
+            }
+        } else {
+            // Unsupported compression method — skip
+            offset += compSize;
+            continue;
+        }
+
+        [extractedFiles addObject:destPath];
+        offset += compSize;
+    }
+
+    return YES;
+}
+
+// ─── Zip ──────────────────────────────────────────────────────────────────────
+
+RCT_EXPORT_METHOD(zip:(NSString *)sourcePath
+                  destPath:(NSString *)destPath
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
+{
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:sourcePath isDirectory:&isDir]) {
+            resolve(@{@"success": @NO, @"error": @"Source path does not exist"});
+            return;
+        }
+
+        // Ensure destination parent directory exists
+        NSString *destParent = [destPath stringByDeletingLastPathComponent];
+        [fm createDirectoryAtPath:destParent withIntermediateDirectories:YES attributes:nil error:nil];
+
+        // Delete existing destination file
+        [fm removeItemAtPath:destPath error:nil];
+
+        NSMutableData *zipData = [NSMutableData new];
+        NSMutableArray<NSDictionary *> *centralDirectory = [NSMutableArray new];
+
+        NSArray<NSString *> *filesToZip;
+        NSString *baseDir;
+        if (isDir) {
+            NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:sourcePath];
+            NSMutableArray *files = [NSMutableArray new];
+            NSString *file;
+            while ((file = [enumerator nextObject])) {
+                NSString *fullPath = [sourcePath stringByAppendingPathComponent:file];
+                BOOL entryIsDir = NO;
+                [fm fileExistsAtPath:fullPath isDirectory:&entryIsDir];
+                [files addObject:file];
+            }
+            filesToZip = files;
+            baseDir = sourcePath;
+        } else {
+            filesToZip = @[[sourcePath lastPathComponent]];
+            baseDir = [sourcePath stringByDeletingLastPathComponent];
+        }
+
+        for (NSString *relativePath in filesToZip) {
+            NSString *fullPath = [baseDir stringByAppendingPathComponent:relativePath];
+            BOOL entryIsDir = NO;
+            [fm fileExistsAtPath:fullPath isDirectory:&entryIsDir];
+
+            NSData *fileData = entryIsDir ? [NSData data] : [NSData dataWithContentsOfFile:fullPath];
+            if (!fileData) continue;
+
+            NSData *entryNameData = [relativePath dataUsingEncoding:NSUTF8StringEncoding];
+            uint16_t nameLen = (uint16_t)entryNameData.length;
+
+            // Deflate compress (skip compression for directories)
+            NSData *compressedData;
+            uint16_t method;
+            uint32_t crc = 0;
+
+            if (entryIsDir || fileData.length == 0) {
+                compressedData = fileData;
+                method = 0;
+            } else {
+                // zlib deflate (raw, -15)
+                uLongf bound = compressBound((uLong)fileData.length);
+                NSMutableData *comp = [NSMutableData dataWithLength:bound];
+                z_stream strm;
+                memset(&strm, 0, sizeof(strm));
+                strm.next_in   = (Bytef *)fileData.bytes;
+                strm.avail_in  = (uInt)fileData.length;
+                strm.next_out  = (Bytef *)comp.mutableBytes;
+                strm.avail_out = (uInt)bound;
+                deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
+                deflate(&strm, Z_FINISH);
+                deflateEnd(&strm);
+                [comp setLength:strm.total_out];
+                compressedData = comp;
+                method = 8;
+            }
+
+            // CRC32
+            crc = (uint32_t)crc32(0L, (const Bytef *)fileData.bytes, (uInt)fileData.length);
+
+            uint32_t localHeaderOffset = (uint32_t)zipData.length;
+
+            // Local file header
+            uint32_t sig       = CFSwapInt32HostToLittle(0x04034b50);
+            uint16_t version   = CFSwapInt16HostToLittle(20);
+            uint16_t flags     = 0;
+            uint16_t meth      = CFSwapInt16HostToLittle(method);
+            uint16_t modTime   = 0, modDate = 0; // no time for simplicity
+            uint32_t crcLE     = CFSwapInt32HostToLittle(crc);
+            uint32_t compSz    = CFSwapInt32HostToLittle((uint32_t)compressedData.length);
+            uint32_t uncompSz  = CFSwapInt32HostToLittle((uint32_t)fileData.length);
+            uint16_t extraLen  = 0;
+
+            [zipData appendBytes:&sig       length:4];
+            [zipData appendBytes:&version   length:2];
+            [zipData appendBytes:&flags     length:2];
+            [zipData appendBytes:&meth      length:2];
+            [zipData appendBytes:&modTime   length:2];
+            [zipData appendBytes:&modDate   length:2];
+            [zipData appendBytes:&crcLE     length:4];
+            [zipData appendBytes:&compSz    length:4];
+            [zipData appendBytes:&uncompSz  length:4];
+            [zipData appendBytes:&nameLen   length:2];
+            [zipData appendBytes:&extraLen  length:2];
+            [zipData appendData:entryNameData];
+            [zipData appendData:compressedData];
+
+            [centralDirectory addObject:@{
+                @"name":            entryNameData,
+                @"method":          @(method),
+                @"crc":             @(crc),
+                @"compSize":        @(compressedData.length),
+                @"uncompSize":      @(fileData.length),
+                @"localOffset":     @(localHeaderOffset),
+            }];
+        }
+
+        // Central directory
+        uint32_t cdOffset = (uint32_t)zipData.length;
+        for (NSDictionary *entry in centralDirectory) {
+            NSData *nameData = entry[@"name"];
+            uint16_t nameLen = (uint16_t)nameData.length;
+            uint32_t cdSig   = CFSwapInt32HostToLittle(0x02014b50);
+            uint16_t verMade = CFSwapInt16HostToLittle(20);
+            uint16_t verNeeded = CFSwapInt16HostToLittle(20);
+            uint16_t flags   = 0;
+            uint16_t meth    = CFSwapInt16HostToLittle((uint16_t)[entry[@"method"] unsignedShortValue]);
+            uint16_t modTime = 0, modDate = 0;
+            uint32_t crcLE   = CFSwapInt32HostToLittle((uint32_t)[entry[@"crc"] unsignedIntValue]);
+            uint32_t compSz  = CFSwapInt32HostToLittle((uint32_t)[entry[@"compSize"] unsignedIntValue]);
+            uint32_t uncompSz = CFSwapInt32HostToLittle((uint32_t)[entry[@"uncompSize"] unsignedIntValue]);
+            uint16_t extraLen = 0, commentLen = 0;
+            uint16_t disk    = 0;
+            uint16_t intAttr = 0;
+            uint32_t extAttr = 0;
+            uint32_t localOff = CFSwapInt32HostToLittle((uint32_t)[entry[@"localOffset"] unsignedIntValue]);
+
+            [zipData appendBytes:&cdSig      length:4];
+            [zipData appendBytes:&verMade    length:2];
+            [zipData appendBytes:&verNeeded  length:2];
+            [zipData appendBytes:&flags      length:2];
+            [zipData appendBytes:&meth       length:2];
+            [zipData appendBytes:&modTime    length:2];
+            [zipData appendBytes:&modDate    length:2];
+            [zipData appendBytes:&crcLE      length:4];
+            [zipData appendBytes:&compSz     length:4];
+            [zipData appendBytes:&uncompSz   length:4];
+            [zipData appendBytes:&nameLen    length:2];
+            [zipData appendBytes:&extraLen   length:2];
+            [zipData appendBytes:&commentLen length:2];
+            [zipData appendBytes:&disk       length:2];
+            [zipData appendBytes:&intAttr    length:2];
+            [zipData appendBytes:&extAttr    length:4];
+            [zipData appendBytes:&localOff   length:4];
+            [zipData appendData:nameData];
+        }
+
+        uint32_t cdSize   = CFSwapInt32HostToLittle((uint32_t)(zipData.length - cdOffset));
+        uint32_t cdOffLE  = CFSwapInt32HostToLittle(cdOffset);
+        uint16_t numEntries = CFSwapInt16HostToLittle((uint16_t)centralDirectory.count);
+        uint16_t commentLen = 0;
+
+        // End of central directory record
+        uint32_t eocdSig = CFSwapInt32HostToLittle(0x06054b50);
+        uint16_t disk = 0;
+        [zipData appendBytes:&eocdSig    length:4];
+        [zipData appendBytes:&disk       length:2];
+        [zipData appendBytes:&disk       length:2];
+        [zipData appendBytes:&numEntries length:2];
+        [zipData appendBytes:&numEntries length:2];
+        [zipData appendBytes:&cdSize     length:4];
+        [zipData appendBytes:&cdOffLE    length:4];
+        [zipData appendBytes:&commentLen length:2];
+
+        NSError *writeErr = nil;
+        if ([zipData writeToFile:destPath options:NSDataWritingAtomic error:&writeErr]) {
+            resolve(@{@"success": @YES, @"zipPath": destPath});
+        } else {
+            resolve(@{@"success": @NO, @"error": writeErr.localizedDescription ?: @"ZIP_WRITE_ERROR"});
+        }
+    });
 }
 
 @end
