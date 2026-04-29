@@ -265,6 +265,8 @@ class DownloaderModule(private val reactContext: ReactApplicationContext) :
                     putString("url", urlString)
                     putString("downloadId", downloadId)
                     putInt("progress", progress)
+                    putDouble("bytesDownloaded", total.toDouble())
+                    putDouble("totalBytes", totalExpected.toDouble())
                   }
                   emit("onDownloadProgress", evt)
                 }

@@ -1215,7 +1215,14 @@ export function useDownload(): UseDownloadReturn {
       }
 
       setResult(res);
-      setStatus(res.success ? 'done' : 'error');
+      const isBackgroundPending =
+        !!options.background &&
+        !!res.success &&
+        !!res.downloadId &&
+        !res.filePath;
+      setStatus(
+        isBackgroundPending ? 'downloading' : res.success ? 'done' : 'error'
+      );
       return res;
     },
     []

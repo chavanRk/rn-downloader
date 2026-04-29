@@ -126,7 +126,7 @@ const promises = urls.map((url) =>
     destination: 'documents',
     queue: true, // join the managed queue
     priority: 'normal', // 'high' | 'normal' (default)
-    onProgress: (p) => console.log(`${url}: ${p}%`),
+    onProgress: (p) => console.log(`${url}: ${p.percent}%`),
   })
 );
 
@@ -479,7 +479,7 @@ Convert base64-encoded data (like images from canvas, camera, or API responses) 
 
 | Type                 | Fields                                                                                                                                           |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `DownloadOptions`    | `url`, `fileName?`, `background?`, `headers?`, `destination?`, `notificationTitle?`, `checksum?`, `onProgress?`, `retry?`, `queue?`, `priority?` |
+| `DownloadOptions`    | `url`, `fileName?`, `background?`, `headers?`, `destination?`, `notificationTitle?`, `notificationDescription?`, `checksum?`, `onProgress?`, `retry?`, `queue?`, `priority?` |
 | `ProgressInfo`       | `percent`, `bytesDownloaded`, `totalBytes`, `speedBps`, `etaSeconds`                                                                             |
 | `RetryOptions`       | `attempts`, `delay?`, `onRetry?`                                                                                                                 |
 | `QueueOptions`       | `maxConcurrent?`                                                                                                                                 |
@@ -508,7 +508,7 @@ Convert base64-encoded data (like images from canvas, camera, or API responses) 
 
 ## Articles & Resources
 
-- [**Why Downloading Files in React Native is Still Broken in 2026 (and How to Fix It)**](https://medium.com/@chavanrohit413/why-downloading-files-in-react-native-is-still-broken-in-2026-and-how-to-fix-it-16ca47a6bd8b) — Deep dive into the problems with existing solutions and how rn-downloader solves them
+- [**I Got Tired of React Native File Downloads Being a Mess — So I Built rn-downloader**](https://medium.com/@chavanrohit413/i-got-tired-of-react-native-file-downloads-being-a-mess-so-i-built-rn-downloader-29b7a8b5c743) — Deep dive into the problems with existing solutions and how rn-downloader solves them
 
 ---
 

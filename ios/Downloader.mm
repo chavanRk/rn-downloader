@@ -567,7 +567,13 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
         NSString *url = downloadTask.originalRequest.URL.absoluteString ?: @"";
 
         [self sendEventWithName:@"onDownloadProgress"
-                           body:@{@"url": url, @"downloadId": downloadId, @"progress": @(progress)}];
+                           body:@{
+                               @"url": url,
+                               @"downloadId": downloadId,
+                               @"progress": @(progress),
+                               @"bytesDownloaded": @(totalBytesWritten),
+                               @"totalBytes": @(totalBytesExpectedToWrite)
+                           }];
     }
 }
 
@@ -1179,6 +1185,20 @@ RCT_EXPORT_METHOD(unzip:(NSString *)sourcePath
         }
 
         NSString *destPath = [destDir stringByAppendingPathComponent:fileName];
+
+        // Protect against zip-slip/path traversal (e.g. ../../outside.txt)
+        NSString *standardizedDestDir = [destDir stringByStandardizingPath];
+        NSString *standardizedDestPath = [destPath stringByStandardizingPath];
+        NSString *safePrefix = [standardizedDestDir stringByAppendingString:@"/"];
+        if (![standardizedDestPath isEqualToString:standardizedDestDir] &&
+            ![standardizedDestPath hasPrefix:safePrefix]) {
+            if (error) {
+                *error = [NSError errorWithDomain:@"RNDownloader"
+                                             code:-100
+                                         userInfo:@{NSLocalizedDescriptionKey: @"ZIP entry has invalid path"}];
+            }
+            return NO;
+        }
 
         // Directory entry
         if ([fileName hasSuffix:@"/"]) {
